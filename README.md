@@ -37,14 +37,14 @@ Download the script, inspect it, and invoke it with parameters:
 
 ```powershell
 Invoke-WebRequest https://raw.githubusercontent.com/ohmacemace/runspur/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.1.0
-.\install.ps1 -Version v0.1.0 -InstallDir "C:\tools\runspur" -NoPathUpdate
+.\install.ps1 -Version v0.1.1
+.\install.ps1 -Version v0.1.1 -InstallDir "C:\tools\runspur" -NoPathUpdate
 ```
 
 Offline installation uses the release ZIP and checksum file:
 
 ```powershell
-.\install.ps1 -Version v0.1.0 -ArchivePath ".\runspur-v0.1.0-windows-x86_64.zip" -ChecksumPath ".\SHA256SUMS.txt"
+.\install.ps1 -Version v0.1.1 -ArchivePath ".\runspur-v0.1.1-windows-x86_64.zip" -ChecksumPath ".\SHA256SUMS.txt"
 ```
 
 Requires Windows PowerShell 5.1 or later. To uninstall, stop Runspur, remove its installation directory, and remove that directory from your user PATH. Keep or delete the application data separately as needed.
@@ -222,8 +222,8 @@ To build a release package and test installation:
 
 ```powershell
 cargo build --workspace --release --locked
-.\scripts\package-windows.ps1 -Tag v0.1.0
-.\scripts\test-distribution.ps1 -Tag v0.1.0
+.\scripts\package-windows.ps1 -Tag v0.1.1
+.\scripts\test-distribution.ps1 -Tag v0.1.1
 ```
 
 Main pushes and pull requests run Windows CI. Version tags trigger the same checks, followed by release builds, installation tests, checksums, and GitHub Release publication.

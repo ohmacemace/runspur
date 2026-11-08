@@ -30,15 +30,25 @@ param(
     $keepBackup = $false
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $headers = @{ "User-Agent" = "Runspur-installer"; "Accept" = "application/vnd.github+json" }
+        $headers = @{ "User-Agent" = "Runspur-installer" }
         $offline = -not [string]::IsNullOrWhiteSpace($ArchivePath)
         if ($offline -ne (-not [string]::IsNullOrWhiteSpace($ChecksumPath))) {
             throw "Offline installation requires both -ArchivePath and -ChecksumPath."
         }
         if ($Version -eq "latest") {
             if ($offline) { throw "Offline installation requires an explicit -Version, for example v0.1.0." }
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" -Headers $headers
-            $Version = [string]$release.tag_name
+            # Public release redirects do not consume the anonymous GitHub REST API quota.
+            $response = Invoke-WebRequest -UseBasicParsing -Method Head -Uri "https://github.com/$repository/releases/latest" -Headers $headers -MaximumRedirection 8
+            if ($null -ne $response.BaseResponse.PSObject.Properties["ResponseUri"]) {
+                $resolved = [Uri]$response.BaseResponse.ResponseUri
+            } else {
+                $resolved = [Uri]$response.BaseResponse.RequestMessage.RequestUri
+            }
+            $releasePath = '^/' + [Regex]::Escape($repository) + '/releases/tag/(v[^/]+)/?$'
+            if ($resolved.Host -ne "github.com" -or $resolved.AbsolutePath -notmatch $releasePath) {
+                throw "Could not resolve a release tag from the public latest-release redirect."
+            }
+            $Version = [Uri]::UnescapeDataString($Matches[1])
         }
         if ($Version -notmatch '^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid release version: $Version" }
         if (-not $Version.StartsWith("v")) { $Version = "v$Version" }

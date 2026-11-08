@@ -980,7 +980,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "scheduler-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "hmac",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",

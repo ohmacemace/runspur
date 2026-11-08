@@ -58,3 +58,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed." }
           $tag = "v$($metadata.packages[0].version)"
           powershell.exe -NoProfile -File scripts/test-distribution.ps1 -Tag $tag -PackageDir "$env:RUNNER_TEMP/runspur-package"
+      - name: Verify latest-release bootstrap with PowerShell 7
+        if: github.repository == 'ohmacemace/runspur'
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "runspur-public-bootstrap"
+          ./install.ps1 -InstallDir $install -NoPathUpdate
+          & (Join-Path $install "schedulerctl.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "Public installer smoke failed." }
