@@ -1,0 +1,439 @@
+use std::{collections::HashSet, path::PathBuf, sync::Mutex, time::Duration};
+
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use scheduler_core::*;
+use scheduler_platform::{
+    BoxStream, connect_pipe, current_principal, process_info, process_principal, read_frame,
+    write_frame,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::{DeliveryOutcome, ParentAdapter, ResolvedParent};
+
+const PIPE: &str = r"\\.\pipe\codex-ipc";
+const MAX_NATIVE_FRAME: usize = 16 * 1024 * 1024;
+const VERIFIED_ASAR: &str = "fb47d6491dc3006b708cb1e14de479b882bf50f88b7daa81818f154c253266aa";
+
+#[derive(Default)]
+pub struct CodexDesktopAdapter {
+    verified_processes: Mutex<HashSet<ProcessIdentity>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NativeGeneration {
+    server_process: ProcessIdentity,
+    owner_client_id: String,
+}
+
+struct NativeConnection {
+    stream: BoxStream,
+    server_process: ProcessIdentity,
+    client_id: String,
+}
+
+impl NativeConnection {
+    async fn connect(adapter: &CodexDesktopAdapter) -> Result<Self> {
+        let peer = connect_pipe(PIPE).await?;
+        adapter.verify_broker(&peer.process).await?;
+        let mut connection = Self {
+            stream: peer.stream,
+            server_process: peer.process,
+            client_id: "initializing-client".into(),
+        };
+        let response = connection
+            .request("initialize", json!({"clientType":"cli"}), 0, None)
+            .await?;
+        connection.client_id = response["result"]["clientId"]
+            .as_str()
+            .context("Desktop initialization did not return a client ID")?
+            .into();
+        Ok(connection)
+    }
+
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        version: u32,
+        target: Option<&str>,
+    ) -> Result<Value> {
+        let id = new_id();
+        write_frame(
+            &mut self.stream,
+            &json!({"type":"request","requestId":id,
+            "sourceClientId":self.client_id,"version":version,"method":method,"params":params,
+            "targetClientId":target,"timeoutMs":10000}),
+            MAX_NATIVE_FRAME,
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let message = self.next_message().await?;
+                if message["type"] == "response" && message["requestId"] == id {
+                    if message["resultType"] == "error" {
+                        bail!(
+                            "Desktop rejected {method}: {}",
+                            message["error"].as_str().unwrap_or("unknown error")
+                        );
+                    }
+                    return Ok(message);
+                }
+            }
+        })
+        .await
+        .context("Desktop request outcome is unknown after timeout")?
+    }
+
+    async fn next_message(&mut self) -> Result<Value> {
+        let message: Value = read_frame(&mut self.stream, MAX_NATIVE_FRAME).await?;
+        if message["type"] == "client-discovery-request" {
+            write_frame(
+                &mut self.stream,
+                &json!({"type":"client-discovery-response",
+                "requestId":message["requestId"],"response":{"canHandle":false}}),
+                MAX_NATIVE_FRAME,
+            )
+            .await?;
+        }
+        Ok(message)
+    }
+
+    async fn owner(&mut self, session: &str) -> Result<String> {
+        let response = self
+            .request(
+                "thread-owner-discovery",
+                json!({"hostId":"local","conversationId":session}),
+                1,
+                None,
+            )
+            .await?;
+        if response["result"]["supportsUntrustedAppInput"] != true {
+            bail!("Desktop owner does not support untrusted external results");
+        }
+        Ok(response["handledByClientId"]
+            .as_str()
+            .context("Desktop did not identify the session owner")?
+            .into())
+    }
+
+    async fn following(&mut self, session: &str, owner: &str, enabled: bool) -> Result<()> {
+        write_frame(
+            &mut self.stream,
+            &json!({"type":"broadcast","method":"thread-stream-following-changed",
+            "sourceClientId":self.client_id,"targetClientIds":[owner],"version":1,
+            "params":{"conversationId":session,"hostId":"local","following":enabled}}),
+            MAX_NATIVE_FRAME,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn snapshot(&mut self, session: &str, owner: &str) -> Result<Value> {
+        self.following(session, owner, true).await?;
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = self.next_message().await?;
+                if message["type"] == "broadcast"
+                    && message["method"] == "thread-stream-state-changed"
+                    && message["sourceClientId"] == owner
+                    && message["params"]["conversationId"] == session
+                    && message["params"]["change"]["type"] == "snapshot"
+                {
+                    return Ok::<_, anyhow::Error>(
+                        message["params"]["change"]["conversationState"].clone(),
+                    );
+                }
+            }
+        })
+        .await
+        .context("Desktop did not provide a bounded current-state snapshot")
+        .and_then(|r| r);
+        let _ = self.following(session, owner, false).await;
+        received
+    }
+}
+
+impl CodexDesktopAdapter {
+    async fn verify_broker(&self, process: &ProcessIdentity) -> Result<()> {
+        if self
+            .verified_processes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Broker cache poisoned"))?
+            .contains(process)
+        {
+            return Ok(());
+        }
+        if process_principal(process.pid)? != current_principal()? {
+            bail!("Desktop pipe belongs to another user");
+        }
+        let info = process_info(process.pid)?;
+        let name = info
+            .executable
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default();
+        if !name.eq_ignore_ascii_case("ChatGPT.exe") && !name.eq_ignore_ascii_case("Codex.exe") {
+            bail!("Desktop pipe is not held by the expected desktop program");
+        }
+        let asar = info
+            .executable
+            .parent()
+            .context("Desktop program directory is unavailable")?
+            .join("resources/app.asar");
+        let hash = tokio::task::spawn_blocking(move || -> Result<String> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(asar)?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            Ok(hex::encode(hash.finalize()))
+        })
+        .await??;
+        if hash != VERIFIED_ASAR {
+            bail!("Desktop distribution is not in this adapter's verified compatibility record");
+        }
+        self.verified_processes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Broker cache poisoned"))?
+            .insert(process.clone());
+        Ok(())
+    }
+
+    async fn resolved(
+        &self,
+        project: &ProjectRecord,
+        origin: &OriginSession,
+    ) -> Result<ResolvedParent> {
+        uuid::Uuid::parse_str(&origin.provider_session_id)
+            .context("Codex origin must be an actual thread UUID")?;
+        let mut connection = NativeConnection::connect(self).await?;
+        let owner = connection.owner(&origin.provider_session_id).await?;
+        let snapshot = connection
+            .snapshot(&origin.provider_session_id, &owner)
+            .await?;
+        let cwd = snapshot["cwd"]
+            .as_str()
+            .context("Desktop snapshot did not provide a working directory")?;
+        let actual = tokio::fs::canonicalize(cwd)
+            .await
+            .context("Cannot validate desktop working directory")?;
+        let expected = tokio::fs::canonicalize(&project.root).await?;
+        let declared = nearest_project(&actual).await?;
+        if let Some(config) = declared {
+            if config.project_id != project.config.project_id {
+                bail!("Desktop origin belongs to another project");
+            }
+        } else if !actual.starts_with(&expected) {
+            bail!("Desktop origin belongs to an unregistered project workspace");
+        }
+        let source = snapshot["threadSource"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if source.contains("subagent") || source.contains("sub_agent") {
+            bail!("A provider subagent thread cannot become a scheduler root");
+        }
+        let generation = NativeGeneration {
+            server_process: connection.server_process,
+            owner_client_id: owner,
+        };
+        Ok(ResolvedParent {
+            generation: scheduler_core::fingerprint(&generation)?,
+            workspace_root: actual,
+            route: ParentRoute {
+                adapter_id: self.id().into(),
+                session_id: origin.provider_session_id.clone(),
+                parameters: serde_json::to_value(generation)?,
+            },
+        })
+    }
+
+    pub fn known_core_path(&self) -> Result<Option<PathBuf>> {
+        let list = self
+            .verified_processes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Broker cache poisoned"))?;
+        for process in list.iter() {
+            if let Ok(info) = process_info(process.pid)
+                && let Some(parent) = info.executable.parent()
+            {
+                let path = parent.join("resources/codex.exe");
+                if path.is_file() {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl ParentAdapter for CodexDesktopAdapter {
+    fn id(&self) -> &'static str {
+        "codex-desktop"
+    }
+    async fn resolve(
+        &self,
+        project: &ProjectRecord,
+        origin: &OriginSession,
+    ) -> Result<ResolvedParent> {
+        #[cfg(windows)]
+        {
+            self.resolved(project, origin).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (project, origin);
+            bail!("Codex desktop return has only been verified on Windows")
+        }
+    }
+    async fn deliver(
+        &self,
+        registration: &Registration,
+        envelope: &DeliveryEnvelope,
+    ) -> DeliveryOutcome {
+        match self.send(registration, envelope).await {
+            Ok(outcome) => outcome,
+            Err(error) => DeliveryOutcome::Unavailable(error.to_string()),
+        }
+    }
+}
+
+impl CodexDesktopAdapter {
+    async fn send(
+        &self,
+        registration: &Registration,
+        envelope: &DeliveryEnvelope,
+    ) -> Result<DeliveryOutcome> {
+        let expected: NativeGeneration =
+            serde_json::from_value(registration.route.parameters.clone())?;
+        let mut connection = NativeConnection::connect(self).await?;
+        let owner = connection.owner(&registration.route.session_id).await?;
+        if connection.server_process != expected.server_process || owner != expected.owner_client_id
+        {
+            return Ok(DeliveryOutcome::Unavailable(
+                "Origin generation requires automatic revalidation".into(),
+            ));
+        }
+        let snapshot = connection
+            .snapshot(&registration.route.session_id, &owner)
+            .await?;
+        if snapshot["threadRuntimeStatus"]["type"] == "active" {
+            if snapshot["threadRuntimeStatus"]["activeFlags"]
+                .as_array()
+                .is_some_and(|flags| {
+                    flags
+                        .iter()
+                        .any(|v| v == "waitingOnApproval" || v == "waitingOnUserInput")
+                })
+            {
+                return Ok(DeliveryOutcome::Held(
+                    "Parent is waiting for approval or user input".into(),
+                ));
+            }
+            return Ok(DeliveryOutcome::Busy);
+        }
+        // This is tool-result data, not a new user authorization. No text item omits UI defaults.
+        let request = native_result_request(&registration.route.session_id, envelope)?;
+        match connection
+            .request(
+                "thread-follower-start-turn",
+                json!({"conversationId":registration.route.session_id,
+            "turnStart":{"request":request,"context":{"inheritThreadSettings":true}}}),
+                2,
+                Some(&owner),
+            )
+            .await
+        {
+            Ok(response) => match response["result"]["result"]["turn"]["id"].as_str() {
+                Some(id) => Ok(DeliveryOutcome::Accepted {
+                    parent_turn_id: id.into(),
+                }),
+                None => Ok(DeliveryOutcome::Uncertain(
+                    "Desktop accepted a response without a correlated turn ID".into(),
+                )),
+            },
+            Err(error) => Ok(DeliveryOutcome::Uncertain(format!(
+                "Result request may have reached the desktop: {error}"
+            ))),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NativeTextInput {
+    r#type: &'static str,
+    text: String,
+    text_elements: Vec<Value>,
+}
+
+fn native_result_request(session: &str, envelope: &DeliveryEnvelope) -> Result<Value> {
+    // Keep this typed even for the empty input list: future text inputs must materialize text_elements.
+    let input: Vec<NativeTextInput> = Vec::new();
+    Ok(
+        json!({"threadId":session,"input":input,"toolOutput":{"name":"runspur_worker_result",
+        "namespace":null,"output":serde_json::to_string(envelope)?,"retain":true}}),
+    )
+}
+
+async fn nearest_project(cwd: &std::path::Path) -> Result<Option<ProjectConfig>> {
+    for directory in cwd.ancestors() {
+        let file = directory.join(PROJECT_FILE);
+        if file.is_file() {
+            let bytes = tokio::fs::read(file).await?;
+            if bytes.len() > MAX_FRAME_BYTES {
+                bail!("Project declaration exceeds the configuration bound");
+            }
+            let config: ProjectConfig = serde_json::from_slice(&bytes)?;
+            validate_project(&config)?;
+            return Ok(Some(config));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_data_shapes_preserve_result_role_and_required_text_arrays() {
+        let text = NativeTextInput {
+            r#type: "text",
+            text: "marker".into(),
+            text_elements: vec![],
+        };
+        let value = serde_json::to_value(text).unwrap();
+        assert_eq!(value["text_elements"], json!([]));
+        let envelope = DeliveryEnvelope {
+            schema_version: 1,
+            kind: "task_completed".into(),
+            task_id: new_id(),
+            delivery_id: new_id(),
+            project_id: new_id(),
+            workspace_root: ".".into(),
+            execution_state: ExecutionState::Failed,
+            result: TaskResult {
+                summary: "data, not authorization".into(),
+                exit_code: Some(1),
+                error_class: Some("worker_failed".into()),
+                verification: vec![],
+                artifact_refs: vec![],
+            },
+            ack_nonce: "nonce".into(),
+        };
+        let request = native_result_request("origin", &envelope).unwrap();
+        assert_eq!(request["input"], json!([]));
+        assert_eq!(request["toolOutput"]["name"], "runspur_worker_result");
+        assert_eq!(request["toolOutput"]["retain"], true);
+        assert!(!request.to_string().contains("role\":\"user"));
+    }
+}

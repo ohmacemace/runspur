@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Package and publish Windows x64
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      RUNSPUR_TAG: ${{ github.ref_name }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Cache release build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release
+      - name: Build release programs
+        run: cargo build --workspace --release --locked
+      - name: Package binaries and license notices
+        run: ./scripts/package-windows.ps1 -Tag $env:RUNSPUR_TAG
+      - name: Test offline installation and packaged programs
+        run: ./scripts/test-distribution.ps1 -Tag $env:RUNSPUR_TAG
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = "dist/runspur-${env:RUNSPUR_TAG}-windows-x86_64.zip"
+          $notes = ".github/release-notes/${env:RUNSPUR_TAG}.md"
+          $arguments = @("release", "create", $env:RUNSPUR_TAG, $archive, "dist/SHA256SUMS.txt", "install.ps1", "--verify-tag", "--title", "Runspur $env:RUNSPUR_TAG")
+          if (Test-Path -LiteralPath $notes) { $arguments += @("--notes-file", $notes) } else { $arguments += "--generate-notes" }
+          if ($env:RUNSPUR_TAG.Contains("-")) { $arguments += "--prerelease" }
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed." }
