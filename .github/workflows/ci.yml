@@ -45,4 +45,16 @@ jobs:
       - name: Check desktop smoke syntax
         run: node --check scripts/windows-desktop-smoke.cjs
       - name: Validate PowerShell scripts
-        run: ./scripts/check-powershell.ps1
+        run: powershell.exe -NoProfile -File scripts/check-powershell.ps1
+      - name: Package programs for installer regression tests
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed." }
+          $tag = "v$($metadata.packages[0].version)"
+          ./scripts/package-windows.ps1 -Tag $tag -BinaryDir target/debug -OutputDir "$env:RUNNER_TEMP/runspur-package"
+      - name: Test PowerShell 5.1 installation and installed programs
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed." }
+          $tag = "v$($metadata.packages[0].version)"
+          powershell.exe -NoProfile -File scripts/test-distribution.ps1 -Tag $tag -PackageDir "$env:RUNNER_TEMP/runspur-package"

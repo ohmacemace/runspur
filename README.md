@@ -208,7 +208,7 @@ cargo test --workspace --locked
 cargo build --workspace --locked
 ```
 
-There are 32 Rust tests covering transactions, automatic conversation isolation, permissions, credentials, named pipes, Job Objects, subprocess output, cancellation, timeouts, MCP stdio, uncertain delivery, and crash recovery.
+There are 32 Rust tests covering transactions, automatic conversation isolation, permissions, credentials, named pipes, Job Objects, subprocess output, cancellation, timeouts, MCP stdio, uncertain delivery, and crash recovery. CI also runs eight PowerShell installation tests, including update rollback, archive validation, and a real installed-service round trip.
 
 The opt-in desktop smoke requires Node.js and the verified running Windows desktop. It creates a fresh project and thread, executes Probe through the real daemon, checks persisted tool-output identity, and restarts its own daemon to verify the delivery receipt:
 
