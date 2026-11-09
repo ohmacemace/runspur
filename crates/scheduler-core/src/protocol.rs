@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{AgentProfile, OriginSession, ProjectRecord, SchedulerError, SubmitTask};
+use crate::{AgentProfile, OriginSession, ProjectRecord, SchedulerError, SubmitTask, WorkerAccess};
 
 pub const WIRE_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -50,6 +50,8 @@ pub struct ClaudeHookCall {
     pub inbox_token: String,
     pub tool_use_id: String,
     pub operation_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 impl std::fmt::Debug for ClaudeHookCall {
@@ -66,6 +68,13 @@ impl std::fmt::Debug for ClaudeHookCall {
 pub enum Operation {
     Health,
     Shutdown,
+    GetSchedulerSettings,
+    SetSchedulerSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_concurrent_workers: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_access: Option<WorkerAccess>,
+    },
     PutProject(ProjectRecord),
     ListProjects,
     PutProfile(AgentProfile),
@@ -194,6 +203,32 @@ impl ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduler_settings_accept_legacy_limit_only_and_access_only_requests() {
+        let legacy: Operation = serde_json::from_str(
+            r#"{"method":"set_scheduler_settings","params":{"max_concurrent_workers":5}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Operation::SetSchedulerSettings {
+                max_concurrent_workers: Some(5),
+                worker_access: None,
+            }
+        ));
+        let access: Operation = serde_json::from_str(
+            r#"{"method":"set_scheduler_settings","params":{"worker_access":"follow_main"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            access,
+            Operation::SetSchedulerSettings {
+                max_concurrent_workers: None,
+                worker_access: Some(WorkerAccess::FollowMain),
+            }
+        ));
+    }
 
     #[test]
     fn task_detail_chunks_fit_the_wire_and_preserve_unicode() {

@@ -68,16 +68,14 @@ pub fn validate_project(config: &ProjectConfig) -> Result<()> {
 }
 
 fn validate_limits(limits: &DispatchLimits) -> Result<()> {
-    if limits.max_concurrent_workers == 0
-        || limits.max_concurrent_workers > 64
-        || limits.max_dispatches_per_root == 0
+    if limits.max_dispatches_per_root == 0
         || limits.default_timeout_seconds == 0
         || limits.max_timeout_seconds < limits.default_timeout_seconds
         || limits.max_timeout_seconds > 7 * 24 * 3600
     {
         return Err(SchedulerError::new(
             "invalid_limits",
-            "Invalid concurrency or timeout limits",
+            "Invalid dispatch count or timeout limits",
         ));
     }
     Ok(())
@@ -206,6 +204,14 @@ pub fn valid_scoped_path(path: &str) -> bool {
 }
 
 pub fn validate_submission(config: &ProjectConfig, submission: &SubmitTask) -> Result<u32> {
+    validate_submission_with_access(config, submission, false)
+}
+
+pub(crate) fn validate_submission_with_access(
+    config: &ProjectConfig,
+    submission: &SubmitTask,
+    bypass_project_write_limit: bool,
+) -> Result<u32> {
     validate_project(config)?;
     if !config
         .allowed_worker_profile_ids
@@ -229,19 +235,8 @@ pub fn validate_submission(config: &ProjectConfig, submission: &SubmitTask) -> R
         ));
     }
     let mode = submission.execution_mode;
-    if !config.limits.permits_execution(mode) {
-        let (code, message) = if mode == crate::ExecutionMode::ProjectWrite {
-            (
-                "project_write_disabled",
-                "Project policy has not enabled project-wide writes",
-            )
-        } else {
-            (
-                "workspace_write_disabled",
-                "Project policy has not enabled scoped writes",
-            )
-        };
-        return Err(SchedulerError::new(code, message));
+    if !bypass_project_write_limit {
+        validate_project_execution_mode(config, mode)?;
     }
     if mode == crate::ExecutionMode::WorkspaceWrite {
         let unique_paths: std::collections::BTreeSet<_> = submission
@@ -277,6 +272,27 @@ pub fn validate_submission(config: &ProjectConfig, submission: &SubmitTask) -> R
         ));
     }
     Ok(timeout)
+}
+
+pub(crate) fn validate_project_execution_mode(
+    config: &ProjectConfig,
+    mode: crate::ExecutionMode,
+) -> Result<()> {
+    if config.limits.permits_execution(mode) {
+        return Ok(());
+    }
+    let (code, message) = if mode == crate::ExecutionMode::ProjectWrite {
+        (
+            "project_write_disabled",
+            "Project policy has not enabled project-wide writes",
+        )
+    } else {
+        (
+            "workspace_write_disabled",
+            "Project policy has not enabled scoped writes",
+        )
+    };
+    Err(SchedulerError::new(code, message))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

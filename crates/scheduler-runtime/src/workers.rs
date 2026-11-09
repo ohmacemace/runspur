@@ -38,7 +38,7 @@ const SCOPED_CLAUDE_AUTH_KEYS: &[&str] = &[
 
 pub fn redact_text(text: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| Regex::new(r#"(?i)(bearer\s+|(?:api[_-]?key|access[_-]?token|messaging[_-]?token|password)\s*[=:]\s*[\"']?)[^\s\"',;]+"#).expect("Static redaction pattern"))
+    PATTERN.get_or_init(|| Regex::new(r#"(?i)(bearer\s+|(?:api[_-]?key|(?:access|auth|messaging)[_-]?token|password)["']?\s*[=:]\s*["']?)[^\s"',;]+"#).expect("Static redaction pattern"))
         .replace_all(text, "${1}<redacted>").into_owned()
 }
 fn redact_json(value: &mut serde_json::Value) {
@@ -216,7 +216,7 @@ fn worker_command(task: &QueuedTask, attempt_dir: &Path) -> Result<Command> {
             .context("Worker has no executable")?,
     )?;
     let mut command = Command::new(program);
-    let scoped = !task.execution_mode.is_read_only();
+    let scoped = !task.native_full && !task.execution_mode.is_read_only();
     let cwd = if scoped {
         scoped_files::ScopedWorkspace::workspace(attempt_dir)
     } else {
@@ -275,7 +275,11 @@ fn worker_command(task: &QueuedTask, attempt_dir: &Path) -> Result<Command> {
                 "--ignore-user-config",
                 "--skip-git-repo-check",
                 "--sandbox",
-                "read-only",
+                if task.native_full {
+                    "danger-full-access"
+                } else {
+                    "read-only"
+                },
                 "--disable",
                 "plugins",
                 "--disable",
@@ -295,7 +299,15 @@ fn worker_command(task: &QueuedTask, attempt_dir: &Path) -> Result<Command> {
             command.arg("-");
         }
         AgentKind::ClaudePrint => {
-            if scoped {
+            if task.native_full {
+                command.args([
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    "{\"mcpServers\":{}}",
+                    "--permission-mode",
+                    "bypassPermissions",
+                ]);
+            } else if scoped {
                 configure_scoped_claude(&mut command, attempt_dir, task.execution_mode)?;
             } else {
                 command.args([
@@ -411,6 +423,9 @@ async fn scoped_workspace(
     task: &QueuedTask,
     attempt_dir: &Path,
 ) -> Result<Option<scoped_files::ScopedWorkspace>> {
+    if task.native_full {
+        return Ok(None);
+    }
     let scope = match task.execution_mode {
         ExecutionMode::ReadOnly => return Ok(None),
         ExecutionMode::WorkspaceWrite if !task.write_scope.is_empty() => {
@@ -568,6 +583,13 @@ pub async fn run_worker(
     fs::create_dir_all(&directory).await?;
     if task.view.cancel_requested || cancel.is_cancelled() {
         return Ok(stopped(task, ExecutionState::Canceled, "canceled"));
+    }
+    if task.access_revoked {
+        return Ok(failed(
+            task,
+            "worker_access_changed",
+            "Worker permissions changed while the task was queued. Submit the task again under the current permissions.".into(),
+        ));
     }
     let workspace = match scoped_workspace(task, &directory).await {
         Ok(workspace) => workspace,
@@ -900,5 +922,17 @@ mod tests {
         redact_json(&mut value);
         assert_eq!(value["messaging_token"], "<redacted>");
         assert!(bounded_text("中文内容", 4).starts_with("中"));
+    }
+
+    #[test]
+    fn logs_redact_secrets_in_embedded_tool_output() {
+        let mut event = serde_json::json!({"content": [
+            {"text": "2\t{\"ANTHROPIC_API_KEY\": \"fake-provider-key\", \"ANTHROPIC_AUTH_TOKEN\": \"fake-auth-token\"}"}
+        ]});
+        redact_json(&mut event);
+        let text = event["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ANTHROPIC_API_KEY"));
+        assert!(!text.contains("fake-provider-key"));
+        assert!(!text.contains("fake-auth-token"));
     }
 }

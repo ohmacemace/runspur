@@ -12,6 +12,9 @@ type Health = {
 };
 
 type Preferences = { language: Language };
+type WorkerAccess = 'project' | 'full' | 'follow_main';
+type SchedulerSettings = { max_concurrent_workers: number; worker_access: WorkerAccess };
+type SchedulerSettingsUpdate = { maxConcurrentWorkers: number } | { workerAccess: WorkerAccess };
 type ServiceCommand = 'service_status' | 'start_service' | 'stop_service';
 
 type Snapshot = {
@@ -31,12 +34,20 @@ const start = element<HTMLButtonElement>('start');
 const stop = element<HTMLButtonElement>('stop');
 const languageSetting = element<HTMLSelectElement>('language-setting');
 const settingsMessage = element('settings-message');
+const schedulerSettingsForm = element<HTMLFormElement>('scheduler-settings-form');
+const schedulerLimit = element<HTMLInputElement>('scheduler-limit');
+const schedulerLimitSave = element<HTMLButtonElement>('scheduler-limit-save');
+const workerAccess = element<HTMLSelectElement>('worker-access');
+const schedulerSettingsMessage = element('scheduler-settings-message');
 let preferences: Preferences | undefined;
 let locale = resolveLocale('system', navigator.language);
 let snapshot: Snapshot | undefined;
 let pending: ServiceCommand | undefined;
 let connectionError: string | undefined;
 let notice: { message: Message; detail?: string } | undefined;
+let schedulerSettings: SchedulerSettings | undefined;
+let schedulerSettingsBusy = false;
+let schedulerNotice: { message: Message; detail?: string } | undefined;
 
 const text = (message: Message) => messages[locale][message];
 const history = createHistory(text);
@@ -91,6 +102,7 @@ async function update(command: ServiceCommand) {
   pending = command;
   refresh.disabled = start.disabled = stop.disabled = true;
   renderService();
+  renderSchedulerSettings();
   try {
     snapshot = await invoke<Snapshot>(command);
     connectionError = undefined;
@@ -104,6 +116,11 @@ async function update(command: ServiceCommand) {
     const ready = snapshot?.status === 'ready';
     history.setReady(ready);
     projects.setReady(ready);
+    if (!ready) showSchedulerSettings(undefined);
+    renderSchedulerSettings();
+    if (ready && (command === 'start_service' || !element('settings').hidden)) {
+      void loadSchedulerSettings();
+    }
   }
 }
 
@@ -121,6 +138,7 @@ function showPage(page: typeof pages[number]) {
   }
   if (page === 'history') history.open();
   if (page === 'projects') void projects.refresh();
+  if (page === 'settings') void loadSchedulerSettings();
 }
 
 for (const page of pages) element(`${page}-nav`).addEventListener('click', () => showPage(page));
@@ -142,6 +160,7 @@ function setLanguage(language: Language) {
   }
   renderService();
   renderNotice();
+  renderSchedulerSettings();
   history.render();
   projects.render();
 }
@@ -171,6 +190,81 @@ async function savePreferences(next: Preferences) {
 
 languageSetting.addEventListener('change', () => {
   void savePreferences({ language: languageSetting.value as Language });
+});
+
+function renderSchedulerSettings() {
+  const ready = snapshot?.status === 'ready' && !pending;
+  schedulerLimit.disabled = schedulerLimitSave.disabled = !ready || schedulerSettingsBusy || !schedulerSettings;
+  workerAccess.disabled = schedulerLimit.disabled || !schedulerSettings?.worker_access;
+  const current = pending ? { message: 'checking' as const }
+    : ready ? schedulerNotice : { message: 'schedulerSettingsOffline' as const };
+  schedulerSettingsMessage.textContent = current
+    ? `${text(current.message)}${current.detail ? ` ${technicalDetails(current.detail)}` : ''}`
+    : '';
+}
+
+function showSchedulerSettings(current: SchedulerSettings | undefined, preserveLimitDraft = false) {
+  if (!preserveLimitDraft || schedulerLimit.value === schedulerSettings?.max_concurrent_workers.toString()) {
+    schedulerLimit.value = current?.max_concurrent_workers.toString() ?? '';
+    schedulerLimit.removeAttribute('aria-invalid');
+  }
+  schedulerSettings = current;
+  workerAccess.value = current?.worker_access ?? 'project';
+}
+
+async function loadSchedulerSettings() {
+  if (snapshot?.status !== 'ready' || pending || schedulerSettingsBusy) return;
+  schedulerSettingsBusy = true;
+  schedulerNotice = undefined;
+  renderSchedulerSettings();
+  try {
+    showSchedulerSettings(await invoke<SchedulerSettings>('get_scheduler_settings'));
+  } catch (error) {
+    showSchedulerSettings(undefined);
+    schedulerNotice = { message: 'schedulerSettingsReadError', detail: String(error) };
+  } finally {
+    schedulerSettingsBusy = false;
+    renderSchedulerSettings();
+  }
+}
+
+async function saveSchedulerLimit() {
+  if (schedulerLimit.disabled) return;
+  const maxConcurrentWorkers = schedulerLimit.valueAsNumber;
+  if (!Number.isInteger(maxConcurrentWorkers) || maxConcurrentWorkers < 1 || maxConcurrentWorkers > 64) {
+    schedulerLimit.setAttribute('aria-invalid', 'true');
+    schedulerNotice = { message: 'schedulerLimitInvalid' };
+    renderSchedulerSettings();
+    return;
+  }
+  schedulerLimit.removeAttribute('aria-invalid');
+  await saveSchedulerSettings({ maxConcurrentWorkers });
+}
+
+async function saveSchedulerSettings(update: SchedulerSettingsUpdate) {
+  schedulerSettingsBusy = true;
+  schedulerNotice = { message: 'saving' };
+  renderSchedulerSettings();
+  try {
+    const current = await invoke<SchedulerSettings>('set_scheduler_settings', update);
+    showSchedulerSettings(current, 'workerAccess' in update);
+    schedulerNotice = { message: 'saved' };
+  } catch (error) {
+    workerAccess.value = schedulerSettings?.worker_access ?? 'project';
+    schedulerNotice = { message: 'schedulerSettingsWriteError', detail: String(error) };
+  } finally {
+    schedulerSettingsBusy = false;
+    renderSchedulerSettings();
+  }
+}
+
+schedulerSettingsForm.addEventListener('submit', event => {
+  event.preventDefault();
+  void saveSchedulerLimit();
+});
+
+workerAccess.addEventListener('change', () => {
+  if (!workerAccess.disabled) void saveSchedulerSettings({ workerAccess: workerAccess.value as WorkerAccess });
 });
 
 async function initialize() {

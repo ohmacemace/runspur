@@ -3,6 +3,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn permission_modes_are_interpreted_without_assuming_unknown_modes() {
+        assert_eq!(
+            hook_main_permission(Some("bypassPermissions")),
+            Some(MainPermission::Full)
+        );
+        assert_eq!(
+            hook_main_permission(Some("plan")),
+            Some(MainPermission::ReadOnly)
+        );
+        for mode in ["default", "acceptEdits", "auto", "dontAsk"] {
+            assert_eq!(
+                hook_main_permission(Some(mode)),
+                Some(MainPermission::Restricted)
+            );
+        }
+        assert_eq!(hook_main_permission(Some("future-mode")), None);
+        assert_eq!(hook_main_permission(None), None);
+    }
+
+    #[test]
     fn wake_contains_only_an_opaque_delivery_id_and_targets_the_native_id() {
         let session = Uuid::new_v4();
         let delivery = Uuid::new_v4();
@@ -74,7 +94,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use scheduler_core::{
-    ClaudeHookCall, MAX_FRAME_BYTES, ParentRoute, ProcessIdentity, ProjectRecord, Registration,
+    ClaudeHookCall, MAX_FRAME_BYTES, MainPermission, ParentRoute, ProcessIdentity, ProjectRecord,
+    Registration,
 };
 use scheduler_platform::{connect_pipe, is_running, process_info};
 use serde_json::{Value, json};
@@ -111,6 +132,7 @@ struct HookCall {
     session: Uuid,
     generation: String,
     operation_sha256: String,
+    main_permission: Option<MainPermission>,
     created: Instant,
 }
 
@@ -220,6 +242,7 @@ impl ClaudeInboxRegistry {
                 session,
                 generation,
                 operation_sha256: hook.operation_sha256,
+                main_permission: hook_main_permission(hook.permission_mode.as_deref()),
                 created: Instant::now(),
             },
         );
@@ -252,11 +275,12 @@ impl ClaudeInboxRegistry {
         if runspur_bridge_image(bridge, &route.owner, true).as_ref() != Some(&route.bridge) {
             bail!("Runspur MCP bridge does not belong to the attested Claude Code process");
         }
-        let resolved = resolved(call.session, route);
+        let mut resolved = resolved(call.session, route);
         let call = state
             .calls
             .remove(&call_key)
             .context("Claude Code tool proof is unavailable")?;
+        resolved.main_permission = call.main_permission;
         Ok((resolved, call.operation_sha256))
     }
 
@@ -324,6 +348,15 @@ impl ClaudeInboxRegistry {
     }
 }
 
+fn hook_main_permission(mode: Option<&str>) -> Option<MainPermission> {
+    match mode? {
+        "bypassPermissions" => Some(MainPermission::Full),
+        "plan" => Some(MainPermission::ReadOnly),
+        "default" | "acceptEdits" | "auto" | "dontAsk" => Some(MainPermission::Restricted),
+        _ => None,
+    }
+}
+
 fn resolved(session: Uuid, route: &InboxRoute) -> ResolvedParent {
     ResolvedParent {
         route: ParentRoute {
@@ -333,6 +366,7 @@ fn resolved(session: Uuid, route: &InboxRoute) -> ResolvedParent {
         },
         generation: route.generation.clone(),
         workspace_root: route.workspace.clone(),
+        main_permission: None,
     }
 }
 

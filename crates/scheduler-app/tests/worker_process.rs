@@ -80,7 +80,7 @@ async fn fixture(
         )
         .await
         .unwrap();
-    let task = store.claim_next().await.unwrap().unwrap();
+    let task = store.claim_next(2).await.unwrap().unwrap();
     (dir, store, paths, task)
 }
 

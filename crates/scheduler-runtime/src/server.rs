@@ -7,7 +7,11 @@ use scheduler_platform::{LocalListener, PeerConnection, proof_payload, read_fram
 use crate::Scheduler;
 
 enum ConnectionAuth {
-    Scheduler(AuthContext, Option<String>),
+    Scheduler {
+        auth: AuthContext,
+        expected_operation_hash: Option<String>,
+        main_permission: Option<MainPermission>,
+    },
     ClaudeHook {
         project_id: String,
         origin: OriginSession,
@@ -87,7 +91,11 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
             bail!("Client authentication proof failed");
         }
         let auth = match &proof.credential {
-            CredentialRef::Admin => ConnectionAuth::Scheduler(AuthContext::Admin, None),
+            CredentialRef::Admin => ConnectionAuth::Scheduler {
+                auth: AuthContext::Admin,
+                expected_operation_hash: None,
+                main_permission: None,
+            },
             CredentialRef::Project { project_id } => match proof.origin.as_ref() {
                 Some(origin) if origin.source == OriginSource::SessionHook => {
                     ConnectionAuth::ClaudeHook {
@@ -96,21 +104,29 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
                     }
                 }
                 Some(origin) if origin.source == OriginSource::ClaudeTool => {
-                    let (auth, operation_hash) = scheduler
+                    let (auth, operation_hash, main_permission) = scheduler
                         .resolve_claude_call(project_id, origin, &peer.process)
                         .await?;
-                    ConnectionAuth::Scheduler(auth, Some(operation_hash))
+                    ConnectionAuth::Scheduler {
+                        auth,
+                        expected_operation_hash: Some(operation_hash),
+                        main_permission,
+                    }
                 }
-                _ => ConnectionAuth::Scheduler(
-                    scheduler
+                _ => {
+                    let (auth, main_permission) = scheduler
                         .resolve_origin_with_peer(
                             project_id,
                             proof.origin.as_ref(),
                             Some(&peer.process),
                         )
-                        .await?,
-                    None,
-                ),
+                        .await?;
+                    ConnectionAuth::Scheduler {
+                        auth,
+                        expected_operation_hash: None,
+                        main_permission,
+                    }
+                }
             },
         };
         Ok::<_, anyhow::Error>((auth, key.sign("server", &payload)))
@@ -151,8 +167,12 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
         )
     } else {
         let result = match auth {
-            ConnectionAuth::Scheduler(auth, expected) => {
-                if expected.as_ref().is_some_and(|expected| {
+            ConnectionAuth::Scheduler {
+                auth,
+                expected_operation_hash,
+                main_permission,
+            } => {
+                if expected_operation_hash.as_ref().is_some_and(|expected| {
                     fingerprint(&request.operation).as_ref() != Ok(expected)
                 }) {
                     Err(SchedulerError::new(
@@ -161,7 +181,9 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
                     )
                     .into())
                 } else {
-                    scheduler.handle(&auth, request.operation).await
+                    scheduler
+                        .handle_with_main_permission(&auth, request.operation, main_permission)
+                        .await
                 }
             }
             ConnectionAuth::ClaudeHook { project_id, origin } => match request.operation {

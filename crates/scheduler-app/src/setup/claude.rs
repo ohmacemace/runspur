@@ -5,8 +5,8 @@ use scheduler_core::{AgentProfile, ProjectConfig};
 use serde_json::{Value, json};
 
 use super::{
-    CleanupEdit, ConfigEdit, HookEdit, ProjectIntegration, bridge::Bridge, mcp_arguments,
-    read_optional_file, skill,
+    CleanupEdit, ConfigEdit, HookEdit, ProjectAdapter, ProjectIntegration, bridge::Bridge,
+    mcp_arguments, read_optional_file, skill,
 };
 
 pub(super) const SKILL_PATH: &str = ".claude/skills/agent-scheduler/SKILL.md";
@@ -231,7 +231,7 @@ pub(super) async fn prepare(
     };
     Ok(ProjectIntegration {
         skill_path,
-        skill_content: skill::render_skill(config, profiles)?,
+        skill_content: skill::render_skill(config, profiles, ProjectAdapter::Claude, data_dir)?,
         config_path,
         skill_old,
         previous,

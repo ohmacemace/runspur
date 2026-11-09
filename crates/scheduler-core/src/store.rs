@@ -39,6 +39,39 @@ pub fn nonce_hash(nonce: &str) -> String {
     hex::encode(Sha256::digest(nonce.as_bytes()))
 }
 
+fn scheduler_worker_limit(connection: &Connection) -> Result<Option<usize>> {
+    Ok(connection
+        .query_row(
+            "SELECT max_concurrent_workers FROM scheduler_settings WHERE id=1",
+            [],
+            |row| row.get::<_, u16>(0).map(usize::from),
+        )
+        .optional()?)
+}
+
+fn scheduler_worker_access(connection: &Connection) -> Result<WorkerAccess> {
+    let access: Option<String> = connection
+        .query_row(
+            "SELECT worker_access FROM scheduler_worker_access WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    access.map_or(Ok(WorkerAccess::default()), |access| {
+        Ok(serde_json::from_value(serde_json::Value::String(access))?)
+    })
+}
+
+fn read_scheduler_settings(
+    connection: &Connection,
+    default_limit: usize,
+) -> Result<SchedulerSettings> {
+    Ok(SchedulerSettings {
+        max_concurrent_workers: scheduler_worker_limit(connection)?.unwrap_or(default_limit),
+        worker_access: scheduler_worker_access(connection)?,
+    })
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)?;
@@ -54,6 +87,12 @@ impl Store {
         }
         let tx = connection.transaction()?;
         tx.execute_batch("\
+            CREATE TABLE IF NOT EXISTS scheduler_settings (
+              id INTEGER PRIMARY KEY CHECK(id=1),
+              max_concurrent_workers INTEGER NOT NULL CHECK(max_concurrent_workers BETWEEN 1 AND 64));
+            CREATE TABLE IF NOT EXISTS scheduler_worker_access (
+              id INTEGER PRIMARY KEY CHECK(id=1),
+              worker_access TEXT NOT NULL CHECK(worker_access IN ('project','full','follow_main')));
             CREATE TABLE IF NOT EXISTS projects (
               id TEXT PRIMARY KEY, root TEXT NOT NULL UNIQUE, revision TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -107,6 +146,61 @@ impl Store {
         })
         .await
         .map_err(|e| SchedulerError::new("storage_join_error", e.to_string()))?
+    }
+
+    pub async fn scheduler_worker_limit(&self) -> Result<Option<usize>> {
+        self.run(|connection| scheduler_worker_limit(connection))
+            .await
+    }
+
+    pub async fn set_scheduler_worker_limit(&self, max_concurrent_workers: usize) -> Result<()> {
+        self.set_scheduler_settings(Some(max_concurrent_workers), None, max_concurrent_workers)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn scheduler_settings(&self, default_limit: usize) -> Result<SchedulerSettings> {
+        self.run(move |connection| {
+            let tx = connection.transaction()?;
+            read_scheduler_settings(&tx, default_limit)
+        })
+        .await
+    }
+
+    pub async fn set_scheduler_settings(
+        &self,
+        max_concurrent_workers: Option<usize>,
+        worker_access: Option<WorkerAccess>,
+        default_limit: usize,
+    ) -> Result<SchedulerSettings> {
+        if max_concurrent_workers.is_some_and(|limit| !(1..=MAX_SCHEDULER_WORKERS).contains(&limit))
+        {
+            return Err(SchedulerError::new(
+                "invalid_scheduler_limit",
+                format!("Global worker limit must be between 1 and {MAX_SCHEDULER_WORKERS}"),
+            ));
+        }
+        self.run(move |connection| {
+            let tx = connection.transaction()?;
+            if let Some(limit) = max_concurrent_workers {
+                tx.execute(
+                    "INSERT INTO scheduler_settings(id, max_concurrent_workers) VALUES(1, ?1)
+                     ON CONFLICT(id) DO UPDATE SET max_concurrent_workers=excluded.max_concurrent_workers",
+                    [limit as i64],
+                )?;
+            }
+            if let Some(access) = worker_access {
+                tx.execute(
+                    "INSERT INTO scheduler_worker_access(id, worker_access) VALUES(1, ?1)
+                     ON CONFLICT(id) DO UPDATE SET worker_access=excluded.worker_access",
+                    [state(access)?],
+                )?;
+            }
+            let settings = read_scheduler_settings(&tx, default_limit)?;
+            tx.commit()?;
+            Ok(settings)
+        })
+        .await
     }
 
     pub async fn put_profile(&self, profile: AgentProfile) -> Result<()> {
@@ -295,21 +389,26 @@ impl Store {
     }
 
     pub async fn submit(&self, auth: &AuthContext, submission: SubmitTask) -> Result<TaskAccepted> {
-        self.submit_checked(auth, submission, |_, _, profile, request| {
-            if matches!(profile.kind, AgentKind::CodexDesktop) {
-                return Err(SchedulerError::new(
-                    "worker_not_supported",
-                    "Desktop parent profile is not a worker executor",
-                ));
-            }
-            if !request.execution_mode.is_read_only() {
-                return Err(SchedulerError::new(
-                    "worker_not_supported",
-                    "Writing requires an authorized worker adapter",
-                ));
-            }
-            Ok(())
-        })
+        self.submit_checked(
+            auth,
+            submission,
+            None,
+            |_, _, profile, request, native_full| {
+                if matches!(profile.kind, AgentKind::CodexDesktop) {
+                    return Err(SchedulerError::new(
+                        "worker_not_supported",
+                        "Desktop parent profile is not a worker executor",
+                    ));
+                }
+                if native_full || !request.execution_mode.is_read_only() {
+                    return Err(SchedulerError::new(
+                        "worker_not_supported",
+                        "Writing requires an authorized worker adapter",
+                    ));
+                }
+                Ok(())
+            },
+        )
         .await
     }
 
@@ -317,16 +416,24 @@ impl Store {
         &self,
         auth: &AuthContext,
         submission: SubmitTask,
-        validate: impl FnOnce(&AgentProfile, &AgentProfile, &SubmitTask, &Registration) -> Result<()>
+        main_permission: Option<MainPermission>,
+        validate: impl FnOnce(
+            &AgentProfile,
+            &AgentProfile,
+            &SubmitTask,
+            &Registration,
+            bool,
+        ) -> Result<()>
         + Send
         + 'static,
     ) -> Result<TaskAccepted> {
         self.submit_checked(
             auth,
             submission,
-            move |tx, registration, profile, request| {
+            main_permission,
+            move |tx, registration, profile, request, native_full| {
                 let main = get_profile(tx, &registration.main_agent_profile_id)?;
-                validate(&main, profile, request, registration)
+                validate(&main, profile, request, registration, native_full)
             },
         )
         .await
@@ -336,7 +443,14 @@ impl Store {
         &self,
         auth: &AuthContext,
         submission: SubmitTask,
-        validate: impl FnOnce(&Transaction<'_>, &Registration, &AgentProfile, &SubmitTask) -> Result<()>
+        main_permission: Option<MainPermission>,
+        validate: impl FnOnce(
+            &Transaction<'_>,
+            &Registration,
+            &AgentProfile,
+            &SubmitTask,
+            bool,
+        ) -> Result<()>
         + Send
         + 'static,
     ) -> Result<TaskAccepted> {
@@ -365,13 +479,23 @@ impl Store {
             if registration.main_agent_profile_id != project.config.main_agent_profile_id {
                 return Err(SchedulerError::new("main_profile_mismatch", "Origin no longer has dispatch rights under current project policy"));
             }
-            let timeout = validate_submission(&project.config, &submission)?;
+            let worker_access = scheduler_worker_access(&tx)?;
+            let allow_full = worker_access.allows_native_full(main_permission);
+            let inherit_read_only = worker_access.inherits_read_only(main_permission);
+            let timeout = validate_submission_with_access(&project.config, &submission, allow_full || inherit_read_only)?;
+            if inherit_read_only && !submission.execution_mode.is_read_only() {
+                return Err(SchedulerError::new("main_permission_read_only", "The main Agent is read-only under the current scheduler settings"));
+            }
             let count: u32 = tx.query_row("SELECT count(*) FROM tasks WHERE root_task_id=?1", [&registration.root_task_id], |r| r.get(0))?;
             if count >= project.config.limits.max_dispatches_per_root {
                 return Err(SchedulerError::new("dispatch_limit_reached", "Root dispatch limit reached"));
             }
             let profile = get_profile(&tx, &submission.worker_profile_id)?;
-            validate(&tx, &registration, &profile, &submission)?;
+            let native_full = worker_access.permits_native_full(main_permission, &profile.kind);
+            if allow_full && !native_full {
+                validate_project_execution_mode(&project.config, submission.execution_mode)?;
+            }
+            validate(&tx, &registration, &profile, &submission, native_full)?;
             let view = TaskView { task_id: new_id(), project_id: project_id.clone(),
                 parent_registration_id: registration_id.clone(), root_task_id: registration.root_task_id,
                 workspace_root: registration.workspace_root.clone(),
@@ -381,7 +505,8 @@ impl Store {
                 parent_turn_id: None, cancel_requested: false };
             let spec = QueuedTask { view: view.clone(), prompt: submission.prompt, timeout_seconds: timeout,
                 project_root: registration.workspace_root, project_config: project.config, profile, attempt_id: new_id(),
-                execution_mode: submission.execution_mode, write_scope: submission.write_scope };
+                execution_mode: submission.execution_mode, write_scope: submission.write_scope,
+                native_full, main_permission, access_revoked: false };
             tx.execute("INSERT INTO tasks(id,project_id,registration_id,root_task_id,idempotency_key,fingerprint,spec,body,execution_state,created_at_ms)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9)",
                 params![view.task_id, project_id, registration_id, view.root_task_id, submission.idempotency_key,
@@ -615,28 +740,41 @@ impl Store {
         .await
     }
 
-    pub async fn claim_next(&self) -> Result<Option<QueuedTask>> {
-        self.run(|c| {
+    pub async fn claim_next(&self, default_max_workers: usize) -> Result<Option<QueuedTask>> {
+        self.run(move |c| {
             let tx = c.transaction()?;
-            let candidates: Vec<String> = {
-                let mut s = tx.prepare("SELECT id FROM tasks WHERE execution_state='queued' ORDER BY sequence LIMIT 128")?;
-                s.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
-            };
-            for id in candidates {
-                let mut spec = get_spec(&tx, &id)?;
-                let active: u32 = tx.query_row("SELECT count(*) FROM tasks WHERE project_id=?1 AND execution_state IN ('starting','running','waiting_approval')",
-                    [&spec.view.project_id], |r| r.get(0))?;
-                if active >= spec.project_config.limits.max_concurrent_workers { continue; }
-                spec.view.execution_state = ExecutionState::Starting;
-                spec.view.started_at_ms = Some(now_ms());
-                write_task(&tx, &spec.view)?;
-                tx.execute("UPDATE attempts SET started_at_ms=?1,lease_until_ms=?2 WHERE id=?3",
-                    params![now_ms(), now_ms() + spec.timeout_seconds as i64 * 1000, spec.attempt_id])?;
-                tx.commit()?;
-                return Ok(Some(spec));
+            let id: Option<String> = tx.query_row(
+                "SELECT id FROM tasks WHERE execution_state='queued' ORDER BY sequence LIMIT 1",
+                [],
+                |row| row.get(0),
+            ).optional()?;
+            let Some(id) = id else { return Ok(None); };
+            let settings = read_scheduler_settings(&tx, default_max_workers)?;
+            let active: i64 = tx.query_row(
+                "SELECT count(*) FROM tasks WHERE execution_state IN ('starting','running','waiting_approval')",
+                [],
+                |row| row.get(0),
+            )?;
+            if active >= settings.max_concurrent_workers as i64 {
+                return Ok(None);
             }
+            let mut spec = get_spec(&tx, &id)?;
+            let access = settings.worker_access;
+            if (spec.native_full && !access.permits_native_full(spec.main_permission, &spec.profile.kind))
+                || (access.inherits_read_only(spec.main_permission) && !spec.execution_mode.is_read_only())
+            {
+                spec.native_full = false;
+                spec.access_revoked = true;
+                tx.execute("UPDATE tasks SET spec=?1 WHERE id=?2", params![encode(&spec)?, id])?;
+            }
+            let started_at = now_ms();
+            spec.view.execution_state = ExecutionState::Starting;
+            spec.view.started_at_ms = Some(started_at);
+            write_task(&tx, &spec.view)?;
+            tx.execute("UPDATE attempts SET started_at_ms=?1,lease_until_ms=?2 WHERE id=?3",
+                params![started_at, started_at + spec.timeout_seconds as i64 * 1000, spec.attempt_id])?;
             tx.commit()?;
-            Ok(None)
+            Ok(Some(spec))
         }).await
     }
 
@@ -1029,6 +1167,46 @@ mod tests {
             write_scope: Vec::new(),
         }
     }
+
+    async fn allow_model_workers(store: &Store, mut project: ProjectRecord) {
+        for (id, kind, program) in [
+            ("codex-main", AgentKind::CodexDesktop, None),
+            (
+                "codex-worker",
+                AgentKind::CodexExec,
+                Some("codex.exe".into()),
+            ),
+            (
+                "claude-worker",
+                AgentKind::ClaudePrint,
+                Some("claude.exe".into()),
+            ),
+        ] {
+            if program.is_some() {
+                project.config.allowed_worker_profile_ids.insert(id.into());
+            }
+            store
+                .put_profile(AgentProfile {
+                    profile_id: id.into(),
+                    kind,
+                    program,
+                    model: None,
+                    reasoning_effort: None,
+                    environment_keys: Default::default(),
+                })
+                .await
+                .unwrap();
+        }
+        store.put_project(project).await.unwrap();
+    }
+
+    fn model_request(key: &str, mode: ExecutionMode) -> SubmitTask {
+        SubmitTask {
+            worker_profile_id: "claude-worker".into(),
+            execution_mode: mode,
+            ..request(key)
+        }
+    }
     fn completion(spec: &QueuedTask) -> Completion {
         Completion {
             schema_version: 1,
@@ -1043,6 +1221,362 @@ mod tests {
                 verification: vec![],
                 artifact_refs: vec![],
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_project_worker_limit_does_not_block_another_task() {
+        let (_dir, store, mut project, origin, _) = fixture().await;
+        project.config.limits.max_concurrent_workers = 1;
+        store.put_project(project).await.unwrap();
+        let first = store.submit(&origin, request("first")).await.unwrap();
+        let second = store.submit(&origin, request("second")).await.unwrap();
+
+        assert_eq!(
+            store.claim_next(2).await.unwrap().unwrap().view.task_id,
+            first.task_id
+        );
+        assert_eq!(
+            store.claim_next(2).await.unwrap().unwrap().view.task_id,
+            second.task_id
+        );
+    }
+
+    #[tokio::test]
+    async fn global_worker_limit_is_shared_live_and_persistent() {
+        let (dir, store, project, origin_a, _) = fixture().await;
+        let mut config = project.config;
+        config.project_id = new_id();
+        let other = store
+            .put_project(ProjectRecord {
+                root: dir.path().join("second-project"),
+                revision: String::new(),
+                config,
+            })
+            .await
+            .unwrap();
+        let registration = store
+            .ensure_registration(
+                &other.config.project_id,
+                &other.config.main_agent_profile_id,
+                ParentRoute {
+                    adapter_id: "test".into(),
+                    session_id: "conversation-other".into(),
+                    parameters: serde_json::json!({}),
+                },
+                "generation-one",
+                other.root,
+            )
+            .await
+            .unwrap();
+        let origin_b = AuthContext::Root {
+            project_id: registration.project_id,
+            registration_id: registration.registration_id,
+        };
+        let first = store.submit(&origin_a, request("first")).await.unwrap();
+        let second = store.submit(&origin_b, request("second")).await.unwrap();
+        let third = store.submit(&origin_a, request("third")).await.unwrap();
+
+        assert_eq!(store.scheduler_worker_limit().await.unwrap(), None);
+        let first_spec = store.claim_next(1).await.unwrap().unwrap();
+        assert_eq!(first_spec.view.task_id, first.task_id);
+        assert!(store.claim_next(1).await.unwrap().is_none());
+
+        store.set_scheduler_worker_limit(2).await.unwrap();
+        let second_spec = store.claim_next(1).await.unwrap().unwrap();
+        assert_eq!(second_spec.view.task_id, second.task_id);
+        assert!(store.claim_next(1).await.unwrap().is_none());
+
+        store.set_scheduler_worker_limit(1).await.unwrap();
+        assert!(store.set_scheduler_worker_limit(0).await.is_err());
+        assert!(store.set_scheduler_worker_limit(65).await.is_err());
+        assert!(store.claim_next(2).await.unwrap().is_none());
+        for spec in [&first_spec, &second_spec] {
+            let view = store
+                .task(&AuthContext::Admin, &spec.view.task_id)
+                .await
+                .unwrap();
+            assert_eq!(view.execution_state, ExecutionState::Starting);
+            assert!(!view.cancel_requested);
+            store
+                .commit_completion(completion(spec), "p".into(), "h".into(), nonce_hash("n"))
+                .await
+                .unwrap();
+            if spec.view.task_id == first.task_id {
+                assert!(store.claim_next(2).await.unwrap().is_none());
+            }
+        }
+        assert_eq!(
+            store.claim_next(2).await.unwrap().unwrap().view.task_id,
+            third.task_id
+        );
+
+        drop(store);
+        let reopened = Store::open(&dir.path().join("state.sqlite3")).unwrap();
+        assert_eq!(reopened.scheduler_worker_limit().await.unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn access_settings_preserve_existing_or_unset_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("legacy.sqlite3");
+        Connection::open(&old_path).unwrap().execute_batch("\
+            PRAGMA user_version=1;
+            CREATE TABLE scheduler_settings(id INTEGER PRIMARY KEY, max_concurrent_workers INTEGER NOT NULL);
+            INSERT INTO scheduler_settings VALUES(1,5);").unwrap();
+        let old = Store::open(&old_path).unwrap();
+        assert_eq!(
+            old.scheduler_settings(2).await.unwrap(),
+            SchedulerSettings {
+                max_concurrent_workers: 5,
+                worker_access: WorkerAccess::Project,
+            }
+        );
+        assert_eq!(
+            old.set_scheduler_settings(None, Some(WorkerAccess::Full), 2)
+                .await
+                .unwrap()
+                .max_concurrent_workers,
+            5
+        );
+        assert_eq!(
+            old.set_scheduler_settings(Some(4), None, 2)
+                .await
+                .unwrap()
+                .worker_access,
+            WorkerAccess::Full
+        );
+        drop(old);
+        let reopened = Store::open(&old_path).unwrap();
+        assert_eq!(
+            reopened.scheduler_settings(2).await.unwrap(),
+            SchedulerSettings {
+                max_concurrent_workers: 4,
+                worker_access: WorkerAccess::Full,
+            }
+        );
+
+        let fresh_path = dir.path().join("fresh.sqlite3");
+        let fresh = Store::open(&fresh_path).unwrap();
+        fresh
+            .set_scheduler_settings(None, Some(WorkerAccess::FollowMain), 2)
+            .await
+            .unwrap();
+        drop(fresh);
+        let reopened = Store::open(&fresh_path).unwrap();
+        assert_eq!(
+            reopened.scheduler_settings(3).await.unwrap(),
+            SchedulerSettings {
+                max_concurrent_workers: 3,
+                worker_access: WorkerAccess::FollowMain,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_applies_access_precedence_without_bypassing_request_validation() {
+        let (_dir, store, project, origin, _) = fixture().await;
+        allow_model_workers(&store, project).await;
+        let write = model_request("write", ExecutionMode::ProjectWrite);
+        let no_adapter_limit =
+            |_: &AgentProfile, _: &AgentProfile, _: &SubmitTask, _: &Registration, _: bool| Ok(());
+        let project_error = store
+            .submit_with_worker_policy(
+                &origin,
+                write.clone(),
+                Some(MainPermission::Full),
+                no_adapter_limit,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(project_error.code, "project_write_disabled");
+
+        store
+            .set_scheduler_settings(None, Some(WorkerAccess::Full), 2)
+            .await
+            .unwrap();
+        for (id, native_full) in [
+            ("claude-worker", true),
+            ("codex-worker", true),
+            ("probe", false),
+        ] {
+            let submission = SubmitTask {
+                worker_profile_id: id.into(),
+                ..request(id)
+            };
+            let accepted = store
+                .submit_with_worker_policy(&origin, submission, None, move |_, _, _, _, allowed| {
+                    assert_eq!(allowed, native_full);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .specification(&accepted.task_id)
+                    .await
+                    .unwrap()
+                    .native_full,
+                native_full
+            );
+        }
+        for (invalid, expected) in [
+            (
+                SubmitTask {
+                    worker_profile_id: "not-allowed".into(),
+                    ..write.clone()
+                },
+                "worker_not_allowed",
+            ),
+            (
+                SubmitTask {
+                    timeout_seconds: Some(0),
+                    ..write.clone()
+                },
+                "invalid_timeout",
+            ),
+            (
+                SubmitTask {
+                    write_scope: vec!["../escape".into()],
+                    execution_mode: ExecutionMode::WorkspaceWrite,
+                    ..write.clone()
+                },
+                "invalid_write_scope",
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .submit_with_worker_policy(&origin, invalid, None, no_adapter_limit)
+                    .await
+                    .unwrap_err()
+                    .code,
+                expected
+            );
+        }
+
+        store
+            .set_scheduler_settings(None, Some(WorkerAccess::FollowMain), 2)
+            .await
+            .unwrap();
+        for permission in [None, Some(MainPermission::Restricted)] {
+            assert_eq!(
+                store
+                    .submit_with_worker_policy(&origin, write.clone(), permission, no_adapter_limit)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "project_write_disabled"
+            );
+        }
+        assert_eq!(
+            store
+                .submit_with_worker_policy(
+                    &origin,
+                    write.clone(),
+                    Some(MainPermission::ReadOnly),
+                    no_adapter_limit
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "main_permission_read_only"
+        );
+        let accepted = store
+            .submit_with_worker_policy(&origin, write, Some(MainPermission::Full), no_adapter_limit)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .specification(&accepted.task_id)
+                .await
+                .unwrap()
+                .native_full
+        );
+    }
+
+    #[tokio::test]
+    async fn claiming_never_upgrades_existing_tasks_and_persists_access_revocation() {
+        let (_dir, store, mut project, origin, _) = fixture().await;
+        project.config.limits.allow_project_write = true;
+        allow_model_workers(&store, project).await;
+        let no_adapter_limit =
+            |_: &AgentProfile, _: &AgentProfile, _: &SubmitTask, _: &Registration, _: bool| Ok(());
+        let legacy = store
+            .submit_with_worker_policy(
+                &origin,
+                model_request("legacy", ExecutionMode::ReadOnly),
+                None,
+                no_adapter_limit,
+            )
+            .await
+            .unwrap();
+        let legacy_id = legacy.task_id.clone();
+        store
+            .run(move |connection| {
+                let mut spec = serde_json::to_value(get_spec(connection, &legacy_id)?)?;
+                let spec = spec.as_object_mut().unwrap();
+                for field in ["native_full", "main_permission", "access_revoked"] {
+                    spec.remove(field);
+                }
+                connection.execute(
+                    "UPDATE tasks SET spec=?1 WHERE id=?2",
+                    params![encode(spec)?, legacy_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let scoped = store
+            .submit_with_worker_policy(
+                &origin,
+                model_request("scoped", ExecutionMode::ProjectWrite),
+                Some(MainPermission::ReadOnly),
+                no_adapter_limit,
+            )
+            .await
+            .unwrap();
+        store
+            .set_scheduler_settings(None, Some(WorkerAccess::Full), 8)
+            .await
+            .unwrap();
+        let legacy_claim = store.claim_next(8).await.unwrap().unwrap();
+        assert_eq!(legacy_claim.view.task_id, legacy.task_id);
+        assert!(!legacy_claim.native_full && !legacy_claim.access_revoked);
+
+        let unverified = store
+            .submit_with_worker_policy(
+                &origin,
+                model_request("unverified", ExecutionMode::ReadOnly),
+                None,
+                no_adapter_limit,
+            )
+            .await
+            .unwrap();
+        let verified = store
+            .submit_with_worker_policy(
+                &origin,
+                model_request("verified", ExecutionMode::ReadOnly),
+                Some(MainPermission::Full),
+                no_adapter_limit,
+            )
+            .await
+            .unwrap();
+        store
+            .set_scheduler_settings(None, Some(WorkerAccess::FollowMain), 8)
+            .await
+            .unwrap();
+        for (expected_id, revoked, full) in [
+            (scoped.task_id, true, false),
+            (unverified.task_id, true, false),
+            (verified.task_id, false, true),
+        ] {
+            let claimed = store.claim_next(8).await.unwrap().unwrap();
+            assert_eq!(claimed.view.task_id, expected_id);
+            assert_eq!(claimed.access_revoked, revoked);
+            assert_eq!(claimed.native_full, full);
+            let persisted = store.specification(&expected_id).await.unwrap();
+            assert_eq!(persisted.access_revoked, revoked);
+            assert_eq!(persisted.native_full, full);
         }
     }
 
@@ -1082,7 +1616,9 @@ mod tests {
             .submit_with_worker_policy(
                 &origin,
                 request("policy"),
-                |main, worker, request, binding| {
+                None,
+                |main, worker, request, binding, native_full| {
+                    assert!(!native_full);
                     assert_eq!(main.profile_id, binding.main_agent_profile_id);
                     assert_eq!(binding.route.adapter_id, "test");
                     assert_eq!(worker.profile_id, request.worker_profile_id);
@@ -1094,15 +1630,15 @@ mod tests {
             )
             .await;
         assert_eq!(rejected.unwrap_err().code, "adapter_not_authorized");
-        assert!(store.claim_next().await.unwrap().is_none());
+        assert!(store.claim_next(2).await.unwrap().is_none());
 
         let accepted = store
-            .submit_with_worker_policy(&origin, request("policy"), |_, _, _, _| Ok(()))
+            .submit_with_worker_policy(&origin, request("policy"), None, |_, _, _, _, _| Ok(()))
             .await
             .unwrap();
         assert!(!accepted.deduplicated);
         assert_eq!(
-            store.claim_next().await.unwrap().unwrap().view.task_id,
+            store.claim_next(2).await.unwrap().unwrap().view.task_id,
             accepted.task_id
         );
     }
@@ -1348,7 +1884,7 @@ mod tests {
         submission.prompt = "逐行检查\nwith original whitespace  ".into();
         submission.timeout_seconds = Some(55);
         let accepted = store.submit(&origin, submission.clone()).await.unwrap();
-        let spec = store.claim_next().await.unwrap().unwrap();
+        let spec = store.claim_next(2).await.unwrap().unwrap();
         let completion = completion(&spec);
         store
             .commit_completion(completion, "path".into(), "digest".into(), "hash".into())
@@ -1384,7 +1920,7 @@ mod tests {
         let error = store.put_project(updated.clone()).await.unwrap_err();
         assert_eq!(error.code, "project_switch_busy");
 
-        let spec = store.claim_next().await.unwrap().unwrap();
+        let spec = store.claim_next(2).await.unwrap().unwrap();
         let result = store
             .commit_completion(
                 completion(&spec),
@@ -1418,7 +1954,7 @@ mod tests {
     async fn queue_claim_is_atomic_under_concurrency() {
         let (_dir, store, _project, a, _b) = fixture().await;
         store.submit(&a, request("one")).await.unwrap();
-        let (one, two) = tokio::join!(store.claim_next(), store.claim_next());
+        let (one, two) = tokio::join!(store.claim_next(2), store.claim_next(2));
         assert_eq!(
             usize::from(one.unwrap().is_some()) + usize::from(two.unwrap().is_some()),
             1
@@ -1429,7 +1965,7 @@ mod tests {
     async fn completion_and_delivery_are_transactional_and_ack_is_scoped() {
         let (_dir, store, _project, a, b) = fixture().await;
         let task = store.submit(&a, request("one")).await.unwrap();
-        let spec = store.claim_next().await.unwrap().unwrap();
+        let spec = store.claim_next(2).await.unwrap().unwrap();
         let done = completion(&spec);
         let result = store
             .commit_completion(
@@ -1515,7 +2051,7 @@ mod tests {
         let (dir, store, _project, a, _b) = fixture().await;
         let first = store.submit(&a, request("one")).await.unwrap();
         let queued = store.submit(&a, request("two")).await.unwrap();
-        let spec = store.claim_next().await.unwrap().unwrap();
+        let spec = store.claim_next(2).await.unwrap().unwrap();
         store
             .commit_completion(
                 completion(&spec),
@@ -1535,7 +2071,7 @@ mod tests {
         );
         assert!(store.due_deliveries(10).await.unwrap().is_empty());
         assert_eq!(
-            store.claim_next().await.unwrap().unwrap().view.task_id,
+            store.claim_next(2).await.unwrap().unwrap().view.task_id,
             queued.task_id
         );
     }
@@ -1573,7 +2109,7 @@ mod tests {
     async fn managed_worker_can_succeed_without_a_process_exit_code() {
         let (_dir, store, _project, origin, _) = fixture().await;
         store.submit(&origin, request("managed")).await.unwrap();
-        let spec = store.claim_next().await.unwrap().unwrap();
+        let spec = store.claim_next(2).await.unwrap().unwrap();
         let mut result = completion(&spec);
         result.result.exit_code = None;
         let stored = store
@@ -1588,7 +2124,7 @@ mod tests {
     async fn invalid_attempt_rolls_back_and_fast_parent_ack_wins_over_transport_update() {
         let (_dir, store, _project, a, _b) = fixture().await;
         store.submit(&a, request("one")).await.unwrap();
-        let spec = store.claim_next().await.unwrap().unwrap();
+        let spec = store.claim_next(2).await.unwrap().unwrap();
         for (exit_code, error_class) in [(Some(1), None), (Some(0), Some("reported_failure"))] {
             let mut invalid = completion(&spec);
             invalid.result.exit_code = exit_code;

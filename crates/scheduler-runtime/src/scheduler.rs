@@ -36,6 +36,7 @@ pub struct Scheduler {
     active: Mutex<HashMap<String, CancellationToken>>,
     wake_tasks: Notify,
     wake_delivery: Notify,
+    default_max_workers: usize,
     slots: Arc<Semaphore>,
 }
 
@@ -75,8 +76,8 @@ impl Scheduler {
         workers: Vec<Arc<dyn WorkerAdapter>>,
         claude_inbox: Option<Arc<ClaudeInboxRegistry>>,
     ) -> Result<Arc<Self>> {
-        if !(1..=64).contains(&max_workers) {
-            bail!("Global worker limit must be between 1 and 64");
+        if !(1..=MAX_SCHEDULER_WORKERS).contains(&max_workers) {
+            bail!("Global worker limit must be between 1 and {MAX_SCHEDULER_WORKERS}");
         }
         let mut parent_ids = HashMap::new();
         let mut parent_kinds = HashMap::new();
@@ -115,7 +116,8 @@ impl Scheduler {
             active: Mutex::new(HashMap::new()),
             wake_tasks: Notify::new(),
             wake_delivery: Notify::new(),
-            slots: Arc::new(Semaphore::new(max_workers)),
+            default_max_workers: max_workers,
+            slots: Arc::new(Semaphore::new(MAX_SCHEDULER_WORKERS)),
         }))
     }
 
@@ -130,6 +132,7 @@ impl Scheduler {
     ) -> Result<AuthContext> {
         self.resolve_origin_with_peer(project_id, origin, None)
             .await
+            .map(|(auth, _)| auth)
     }
 
     pub(crate) async fn resolve_origin_with_peer(
@@ -137,7 +140,7 @@ impl Scheduler {
         project_id: &str,
         origin: Option<&OriginSession>,
         peer: Option<&ProcessIdentity>,
-    ) -> Result<AuthContext> {
+    ) -> Result<(AuthContext, Option<MainPermission>)> {
         let project = self.store.project(project_id).await?;
         let profile = self
             .store
@@ -153,7 +156,9 @@ impl Scheduler {
         if resolved.route.adapter_id != adapter.id() {
             bail!("Parent adapter returned an invalid route");
         }
-        self.register_origin(project_id, &profile, resolved).await
+        let main_permission = resolved.main_permission;
+        let auth = self.register_origin(project_id, &profile, resolved).await?;
+        Ok((auth, main_permission))
     }
 
     pub(crate) async fn register_claude_hook(
@@ -201,7 +206,7 @@ impl Scheduler {
         project_id: &str,
         origin: &OriginSession,
         peer: &ProcessIdentity,
-    ) -> Result<(AuthContext, String)> {
+    ) -> Result<(AuthContext, String, Option<MainPermission>)> {
         let inbox = self
             .claude_inbox
             .as_ref()
@@ -217,8 +222,9 @@ impl Scheduler {
         }
         let (resolved, operation_sha256) =
             inbox.consume(&project, &origin.provider_session_id, peer)?;
+        let main_permission = resolved.main_permission;
         let auth = self.register_origin(project_id, &profile, resolved).await?;
-        Ok((auth, operation_sha256))
+        Ok((auth, operation_sha256, main_permission))
     }
 
     async fn register_origin(
@@ -247,7 +253,24 @@ impl Scheduler {
         Ok(parent_adapter(&self.parent_kinds, profile)?.clone())
     }
 
+    async fn scheduler_settings(&self) -> Result<SchedulerSettings> {
+        Ok(self
+            .store
+            .scheduler_settings(self.default_max_workers)
+            .await?)
+    }
+
     pub async fn handle(&self, auth: &AuthContext, operation: Operation) -> Result<Value> {
+        self.handle_with_main_permission(auth, operation, None)
+            .await
+    }
+
+    pub(crate) async fn handle_with_main_permission(
+        &self,
+        auth: &AuthContext,
+        operation: Operation,
+        main_permission: Option<MainPermission>,
+    ) -> Result<Value> {
         let value = match operation {
             Operation::Health => {
                 json!({"version":env!("CARGO_PKG_VERSION"),"protocol_version":WIRE_VERSION,
@@ -256,6 +279,26 @@ impl Scheduler {
             Operation::Shutdown => {
                 auth.require_admin()?;
                 serde_json::to_value(identity(std::process::id())?)?
+            }
+            Operation::GetSchedulerSettings => {
+                auth.require_admin()?;
+                json!(self.scheduler_settings().await?)
+            }
+            Operation::SetSchedulerSettings {
+                max_concurrent_workers,
+                worker_access,
+            } => {
+                auth.require_admin()?;
+                let settings = self
+                    .store
+                    .set_scheduler_settings(
+                        max_concurrent_workers,
+                        worker_access,
+                        self.default_max_workers,
+                    )
+                    .await?;
+                self.wake_tasks.notify_one();
+                json!(settings)
             }
             Operation::PutProfile(profile) => {
                 auth.require_admin()?;
@@ -266,6 +309,7 @@ impl Scheduler {
                 let profiles = self.store.profiles().await?;
                 if let AuthContext::Root { project_id, .. } = auth {
                     let project = self.store.project(project_id).await?;
+                    let access = self.scheduler_settings().await?.worker_access;
                     json!(
                         profiles
                             .into_iter()
@@ -275,7 +319,16 @@ impl Scheduler {
                                     .allowed_worker_profile_ids
                                     .contains(&p.profile_id))
                             .map(|p| {
-                                let adapter = self.worker_adapters.get(&p.kind);
+                                let adapter = self.worker_adapters.get(&p.kind).filter(|_| {
+                                    project
+                                        .config
+                                        .allowed_worker_profile_ids
+                                        .contains(&p.profile_id)
+                                });
+                                let native_full = adapter.is_some()
+                                    && access.permits_native_full(main_permission, &p.kind);
+                                let read_only = access == WorkerAccess::FollowMain
+                                    && main_permission == Some(MainPermission::ReadOnly);
                                 let modes = [
                                     ExecutionMode::ReadOnly,
                                     ExecutionMode::WorkspaceWrite,
@@ -283,12 +336,17 @@ impl Scheduler {
                                 ]
                                 .into_iter()
                                 .filter(|mode| {
-                                    project.config.limits.permits_execution(*mode)
-                                        && adapter.is_some_and(|worker| worker.supports(*mode))
+                                    native_full
+                                        || adapter.is_some_and(|worker| {
+                                            (!read_only || mode.is_read_only())
+                                                && project.config.limits.permits_execution(*mode)
+                                                && worker.supports(*mode)
+                                        })
                                 })
                                 .collect::<Vec<_>>();
                                 json!({"profile_id":p.profile_id,"kind":p.kind,
                                     "worker": adapter.is_some(),
+                                    "native_full_access": native_full,
                                     "execution_modes": modes})
                             })
                             .collect::<Vec<_>>()
@@ -329,7 +387,7 @@ impl Scheduler {
             Operation::SessionStatus => {
                 let (project, registration) = auth.root()?;
                 let origin = self.store.registration(registration).await?;
-                json!({"project":self.store.project(project).await?, "origin":{
+                json!({"project":self.store.project(project).await?, "scheduler":self.scheduler_settings().await?, "origin":{
                     "origin_id": origin.registration_id,
                     "workspace_root": origin.workspace_root,
                     "route": {"adapter_id": origin.route.adapter_id, "session_id": origin.route.session_id}
@@ -343,7 +401,8 @@ impl Scheduler {
                     .submit_with_worker_policy(
                         auth,
                         submission,
-                        move |main, worker, task, origin| {
+                        main_permission,
+                        move |main, worker, task, origin, native_full| {
                             let parent = parent_adapter(&parents, main)?;
                             if origin.route.adapter_id != parent.id() {
                                 return Err(SchedulerError::new(
@@ -353,7 +412,7 @@ impl Scheduler {
                             }
                             let worker = worker_adapter(&workers, worker)?;
                             validate_pair(parent.as_ref(), worker.as_ref())?;
-                            if !worker.supports(task.execution_mode) {
+                            if !native_full && !worker.supports(task.execution_mode) {
                                 return Err(SchedulerError::new(
                                     "execution_mode_unsupported",
                                     "Selected child Agent does not support this execution mode",
@@ -564,7 +623,7 @@ impl Scheduler {
                 let Ok(permit) = self.slots.clone().try_acquire_owned() else {
                     break;
                 };
-                let task = match self.store.claim_next().await {
+                let task = match self.store.claim_next(self.default_max_workers).await {
                     Ok(Some(task)) => task,
                     Ok(None) => break,
                     Err(error) => {

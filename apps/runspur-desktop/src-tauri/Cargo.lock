@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "runspur-desktop"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "scheduler-app",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-app"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hex",
  "hmac",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-platform"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2936,7 +2936,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-runtime"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",

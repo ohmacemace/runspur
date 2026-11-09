@@ -8,7 +8,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use scheduler_core::{AgentKind, AgentProfile, Operation, ProjectRecord, TaskDetail, new_id};
+use scheduler_core::{
+    AgentKind, AgentProfile, Operation, ProjectRecord, TaskDetail, WorkerAccess, new_id,
+};
 use scheduler_platform::LocalClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,6 +59,23 @@ pub struct PreviewReply {
     allow_project_write: bool,
     #[serde(flatten)]
     preview: ProjectSetupPreview,
+}
+
+pub async fn scheduler_settings(client: &LocalClient) -> Result<Value> {
+    client.call(Operation::GetSchedulerSettings).await
+}
+
+pub async fn set_scheduler_settings(
+    client: &LocalClient,
+    max_concurrent_workers: Option<usize>,
+    worker_access: Option<WorkerAccess>,
+) -> Result<Value> {
+    client
+        .call(Operation::SetSchedulerSettings {
+            max_concurrent_workers,
+            worker_access,
+        })
+        .await
 }
 
 pub async fn projects_list(client: &LocalClient) -> Result<Vec<OperatorProject>> {

@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# NSIS also registers the product for the current user, even with a custom install directory.
+# The MSI registers the product system-wide, even with a custom install directory.
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
     $env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64' -or -not $env:RUNNER_TEMP) {
     throw 'Run the installer smoke only on a clean GitHub-hosted Windows runner.'
@@ -25,31 +25,30 @@ function Get-RunspurRegistration {
     }
 }
 
-function Invoke-Nsis {
-    param([string]$Program, [string]$Arguments)
+function Invoke-Msi {
+    param([string]$Arguments, [string]$LogPath)
 
-    $process = Start-Process -FilePath $Program -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    $program = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    $argumentsWithLog = "$Arguments /quiet /norestart /L*v `"$LogPath`""
+    $process = Start-Process -FilePath $program -ArgumentList $argumentsWithLog -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(120000)) {
         $process.Kill()
         $null = $process.WaitForExit(5000)
-        throw "NSIS process timed out: $Program"
+        throw "Windows Installer timed out: $Arguments"
     }
-    if ($process.ExitCode -ne 0) { throw "NSIS process failed with exit code $($process.ExitCode): $Program" }
+    if ($process.ExitCode -ne 0) {
+        if (Test-Path -LiteralPath $LogPath) { Get-Content -LiteralPath $LogPath -Tail 80 | Write-Host }
+        throw "Windows Installer failed with exit code $($process.ExitCode): $Arguments"
+    }
 }
 
 function Uninstall-TestApp {
-    param([string]$Program, [string]$Directory)
+    param([string]$Installer, [string]$Directory, [string]$LogPath)
 
-    Invoke-Nsis -Program $Program -Arguments '/S'
-    # The temporary uninstaller removes the directory before deleting its registration.
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    do {
-        $directoryPresent = Test-Path -LiteralPath $Directory
-        $registrationPresent = @(Get-RunspurRegistration).Count -ne 0
-        if (-not $directoryPresent -and -not $registrationPresent) { return }
-        Start-Sleep -Milliseconds 250
-    } while ($clock.Elapsed.TotalSeconds -lt 30)
-    throw "Silent uninstall did not finish (directory present: $directoryPresent, registration present: $registrationPresent)."
+    Invoke-Msi -Arguments "/uninstall `"$Installer`"" -LogPath $LogPath
+    if ((Test-Path -LiteralPath $Directory) -or @(Get-RunspurRegistration).Count -ne 0) {
+        throw 'Silent MSI uninstall left an installation directory or registration.'
+    }
 }
 
 function Get-InstalledScheduler {
@@ -89,8 +88,8 @@ function Remove-TestDirectory {
 }
 
 $installer = Get-Item -LiteralPath $InstallerPath
-if ($installer.PSIsContainer -or $installer.Extension -ne '.exe') {
-    throw 'A built Runspur Desktop NSIS executable is required.'
+if ($installer.PSIsContainer -or $installer.Extension -ne '.msi') {
+    throw 'A built Runspur Desktop MSI package is required.'
 }
 $tempRoot = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path.TrimEnd('\')
 $localData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -108,7 +107,8 @@ $install = Join-Path $temporary ('installed ' + [char]0x6D4B + [char]0x8BD5)
 $desktop = Join-Path $install 'runspur-desktop.exe'
 $daemon = Join-Path $install 'schedulerd.exe'
 $control = Join-Path $install 'schedulerctl.exe'
-$uninstaller = Join-Path $install 'uninstall.exe'
+$installLog = Join-Path $temporary 'msi-install.log'
+$uninstallLog = Join-Path $temporary 'msi-uninstall.log'
 $useDesktop = [Environment]::UserInteractive -and (Get-Process -Id $PID).SessionId -ne 0
 $defaultState = Join-Path $runspurData 'Runspur\data'
 $state = if ($useDesktop) { $defaultState } else { Join-Path $temporary 'isolated state' }
@@ -116,9 +116,12 @@ $app = $null
 $uninstallAttempted = $false
 
 try {
-    # NSIS requires /D to be last and unquoted, including when the path has spaces.
-    Invoke-Nsis -Program $installer.FullName -Arguments "/S /D=$install"
-    foreach ($name in 'runspur-desktop.exe', 'schedulerd.exe', 'schedulerctl.exe', 'scheduler-mcp.exe', 'uninstall.exe') {
+    Invoke-Msi -Arguments "/package `"$($installer.FullName)`" INSTALLDIR=`"$install`"" -LogPath $installLog
+    $registrations = @(Get-RunspurRegistration)
+    if ($registrations.Count -ne 1 -or $registrations[0].WindowsInstaller -ne 1 -or $registrations[0].DisplayVersion -ne $ExpectedVersion) {
+        throw "Expected one Windows Installer registration for Runspur Desktop $ExpectedVersion."
+    }
+    foreach ($name in 'runspur-desktop.exe', 'schedulerd.exe', 'schedulerctl.exe', 'scheduler-mcp.exe') {
         if (-not (Test-Path -LiteralPath (Join-Path $install $name) -PathType Leaf)) { throw "Installed file missing: $name" }
     }
     $appVersion = (Get-Item -LiteralPath $desktop).VersionInfo.ProductVersion
@@ -170,14 +173,14 @@ try {
     }
     $savedDatabase = (Get-FileHash -LiteralPath $database -Algorithm SHA256).Hash
     $uninstallAttempted = $true
-    Uninstall-TestApp -Program $uninstaller -Directory $install
+    Uninstall-TestApp -Installer $installer.FullName -Directory $install -LogPath $uninstallLog
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
         -not (Test-Path -LiteralPath $database -PathType Leaf) -or
         (Get-FileHash -LiteralPath $database -Algorithm SHA256).Hash -ne $savedDatabase) {
         throw 'Silent uninstall changed or removed the test scheduler state.'
     }
     $mode = if ($useDesktop) { 'Desktop automatic scheduler startup' } else { 'installed scheduler startup' }
-    Write-Host "Runspur Desktop $ExpectedVersion passed NSIS installation, $mode, health, shutdown, and state-preserving uninstall."
+    Write-Host "Runspur Desktop $ExpectedVersion passed MSI installation, $mode, health, shutdown, and state-preserving uninstall."
 } finally {
     Close-TestApp -Process $app
     foreach ($program in @($daemon, $control)) {
@@ -189,8 +192,8 @@ try {
             }
         }
     }
-    if (-not $uninstallAttempted -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
-        Uninstall-TestApp -Program $uninstaller -Directory $install
+    if (-not $uninstallAttempted -and @(Get-RunspurRegistration).Count -ne 0) {
+        Uninstall-TestApp -Installer $installer.FullName -Directory $install -LogPath $uninstallLog
     }
     if ($useDesktop -and (Test-Path -LiteralPath (Join-Path $defaultState '.runspur-state-version') -PathType Leaf)) {
         Remove-TestDirectory -Path $defaultState -Parent (Join-Path $runspurData 'Runspur') -NamePattern '^data$'

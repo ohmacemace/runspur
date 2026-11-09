@@ -10,11 +10,11 @@ Runspur lets Codex and Claude Code work together on a project. Your main Agent c
 
 ## Install
 
-Runspur is available for **Windows x64**. Choose either client. Both manage projects and dispatch history through the same local scheduler.
+The desktop app and npm CLI are available for **Windows x64**. They share the local scheduler, project settings, and dispatch history.
 
 ### Windows app
 
-Download and run the Windows x64 setup executable, then open **Runspur**. The app starts the scheduler automatically. [Download the Windows installer](https://github.com/ohmacemace/runspur/releases/latest)
+Download and run the Windows x64 MSI, then open **Runspur**. The app starts the scheduler automatically. [Download the Windows installer](https://github.com/ohmacemace/runspur/releases/latest)
 
 ### CLI
 
@@ -31,18 +31,24 @@ runspur tui
 
 1. Install the Agent clients you plan to use. Workers use their provider's CLI.
 2. In Runspur, choose **Projects → Add project** and select a folder. Choose a main Agent and a worker from the other provider, set the worker's permissions, then preview and confirm the integration.
-3. Open a new conversation in your main Agent from the project directory. Give it a task with work it can delegate. If Claude Code asks to enable the project's Runspur MCP server, approve it in Claude Code.
+3. Open a new conversation in your main Agent from the project directory. Give it a task it can delegate as a whole or in parallel. If Claude Code asks to enable the project's Runspur MCP server, approve it in Claude Code.
 
 Open **Dispatch history** to see who worked on a task, what they returned, and whether the result reached the original conversation. To change Agents or permissions, select the project and choose **Edit configuration**.
 
-Workers start with read-only access. You can allow writes to files named in the task or text edits across the project. Write tasks produce changes in a separate workspace for the main Agent to review and apply.
+Use **Settings** to set the global concurrency limit and child Agent access for all projects. Extra tasks wait in the queue.
+
+- **Use project permissions** is the default. Projects start read-only and can allow edits to named files or text edits across an isolated copy of the project.
+- **Full access** runs the worker with its native shell and file tools. It can edit the live project and access files outside it with your OS account's permissions.
+- **Follow main Agent** uses native full access when Runspur verifies the main Agent's full mode and read-only access when it verifies a read-only mode. Other modes and unavailable signals use project permissions.
+
+For an existing connection, preview and save **Edit configuration**, then open a new main Agent conversation to load the current Runspur Skill.
 
 ## Agent compatibility
 
 | Agent | Main Agent | Worker |
 | --- | --- | --- |
-| Codex | Windows desktop, experimental. Verified with `OpenAI.Codex 26.1103.4239.0` (core `0.167.0-alpha.3.2`). | Codex CLI, read-only |
-| Claude Code | CLI 2.1.319 or later | CLI 2.1.319 or later for read-only. Use 2.1.319 for writes. |
+| Codex | Windows desktop, experimental. Verified with `OpenAI.Codex 26.1103.4239.0` (core `0.167.0-alpha.3.2`). | Codex CLI, read-only or native full access |
+| Claude Code | CLI 2.1.319 or later | CLI 2.1.319 or later. Use 2.1.319 for isolated writes. |
 
 Claude Desktop is untested.
 

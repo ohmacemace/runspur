@@ -4,8 +4,8 @@ use anyhow::{Context, Result, bail};
 use scheduler_core::{AgentProfile, ProjectConfig};
 
 use super::{
-    CleanupEdit, ConfigEdit, ProjectIntegration, bridge::Bridge, mcp_arguments, read_optional_file,
-    skill,
+    CleanupEdit, ConfigEdit, ProjectAdapter, ProjectIntegration, bridge::Bridge, mcp_arguments,
+    read_optional_file, skill,
 };
 
 pub(super) const SKILL_PATH: &str = ".agents/skills/agent-scheduler/SKILL.md";
@@ -165,7 +165,7 @@ pub(super) async fn prepare(
     remove_runspur_startup_instructions(&mut document)?;
     Ok(ProjectIntegration {
         skill_path,
-        skill_content: skill::render_skill(config, profiles)?,
+        skill_content: skill::render_skill(config, profiles, ProjectAdapter::Codex, data_dir)?,
         config_path,
         skill_old,
         previous,

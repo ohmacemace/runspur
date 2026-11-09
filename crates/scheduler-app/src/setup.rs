@@ -527,8 +527,12 @@ impl ProjectSetup {
         )
         .await?;
         if adapter != self.adapter
-            || skill::render_skill(&self.record.config, &profiles)?
-                != self.integration.skill_content
+            || skill::render_skill(
+                &self.record.config,
+                &profiles,
+                adapter,
+                Some(&client.paths.root),
+            )? != self.integration.skill_content
         {
             bail!("Agent profiles changed after preview. Preview it again before confirming.");
         }
@@ -1285,7 +1289,17 @@ mod tests {
             .unwrap();
         let generated = tokio::fs::read_to_string(&skill).await.unwrap();
         assert!(description(&generated).contains("Claude Code (CC)"));
+        assert!(description(&generated).contains("built-in subagents"));
         assert!(!description(&generated).contains("Probe"));
+        assert!(
+            generated.contains("consider both built-in subagents and permitted Runspur workers")
+        );
+        assert!(generated.contains("use both for distinct work"));
+        assert!(generated.contains("Omit `timeout_seconds` by default"));
+        assert!(generated.contains("# Worker routing notes"));
+        assert!(generated.contains("claude-cli.md"));
+        assert!(generated.contains("Only update a note if the evidence changes future routing"));
+        assert!(generated.contains("A timeout alone is inconclusive"));
         install_project(dir.path(), &config, "scheduler-mcp", None, &[])
             .await
             .unwrap();
@@ -1298,6 +1312,7 @@ mod tests {
         let generated = tokio::fs::read_to_string(&skill).await.unwrap();
         assert!(!description(&generated).contains("Claude Code (CC)"));
         assert!(description(&generated).contains("Probe"));
+        assert!(!generated.contains("# Worker routing notes"));
 
         let text = tokio::fs::read_to_string(&settings).await.unwrap();
         assert_eq!(

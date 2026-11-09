@@ -56,7 +56,7 @@ struct SubmitParams {
     /// Reuse this key when retrying the exact same logical submission.
     idempotency_key: String,
     timeout_seconds: Option<u32>,
-    /// Request scoped writes when the project and selected child Agent allow them.
+    /// Choose the advertised mode for the deliverable. Omission defaults to read-only in project access mode. Native full access uses the worker's own shell and file tools in the live project.
     execution_mode: Option<McpExecutionMode>,
     /// Exact project-relative file paths writable in the isolated task workspace.
     #[serde(default)]
@@ -105,10 +105,10 @@ impl ProjectMcp {
             bail!("MCP integration is disabled for this project");
         }
         let mut tools = vec![
-            Tool::new("scheduler_context", "Get this project's effective policy and the automatically resolved origin session.", JsonObject::new()).with_input_schema::<EmptyParams>(),
-            Tool::new("scheduler_agents", "List child Agents available for this project, such as Claude Code (CC) and Codex.", JsonObject::new()).with_input_schema::<EmptyParams>(),
-            Tool::new("scheduler_submit", "Delegate a task to an allowed child Agent. Use workspace_write with exact writable files or project_write when project-wide editing is authorized. Both write modes produce artifacts in an isolated task workspace. Returns a task ID immediately.", JsonObject::new()).with_input_schema::<SubmitParams>(),
-            Tool::new("scheduler_task", "Read one task owned by this origin session for an explicit status or diagnostic request.", JsonObject::new()).with_input_schema::<TaskParams>(),
+            Tool::new("scheduler_context", "Get this project's policy, the origin session, and global worker settings.", JsonObject::new()).with_input_schema::<EmptyParams>(),
+            Tool::new("scheduler_agents", "List the project's child Agents, their available execution modes, and whether native full access is active for this session.", JsonObject::new()).with_input_schema::<EmptyParams>(),
+            Tool::new("scheduler_submit", "Give an allowed child Agent ownership of a complete task or an independent deliverable. Choose an advertised execution mode that fits the work. In native full access the worker can use its shell and edit the live project. Project-scoped writes return isolated artifacts. The call queues the task and returns an ID immediately. Account for required results before reporting completion.", JsonObject::new()).with_input_schema::<SubmitParams>(),
+            Tool::new("scheduler_task", "Check one task's progress or result in the originating session when needed for dependent work.", JsonObject::new()).with_input_schema::<TaskParams>(),
             Tool::new("scheduler_tasks", "List this origin session's recent tasks.", JsonObject::new()).with_input_schema::<ListParams>(),
             Tool::new("scheduler_cancel", "Request cancellation of one task owned by this origin session.", JsonObject::new()).with_input_schema::<TaskParams>(),
             Tool::new("scheduler_ack", "Confirm consumption of the returned result, using its delivery_id and ack_nonce.", JsonObject::new()).with_input_schema::<AckParams>(),
@@ -238,6 +238,7 @@ struct NativeClaudeHook {
     tool_input: Value,
     tool_use_id: String,
     agent_id: Option<String>,
+    permission_mode: Option<String>,
     mcp_server: ClaudeMcpServer,
 }
 
@@ -290,6 +291,7 @@ pub async fn register_native_claude_hook(
             .context("Claude Code native inbox token is unavailable")?,
         tool_use_id: hook.tool_use_id,
         operation_sha256: fingerprint(&operation)?,
+        permission_mode: hook.permission_mode,
     };
     LocalClient {
         paths,
@@ -321,7 +323,7 @@ impl ServerHandler for ProjectMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("runspur-scheduler", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Runspur lets the main Agent delegate independent work to child Agents permitted by the project. For availability questions, use scheduler_context and scheduler_agents. For an assignment, send the child Agent a direct task brief with scheduler_submit. Results are delivered to the originating conversation. Child Agents cannot delegate further.")
+            .with_instructions("Runspur child Agents can complete whole assignments, including implementation when their advertised access permits it. Check scheduler_context and scheduler_agents, then dispatch early with scheduler_submit. Keep each deliverable with its assigned Agent. Results return asynchronously to the originating conversation. Account for required results before reporting completion. Child Agents cannot delegate through Runspur.")
     }
     async fn list_tools(
         &self,

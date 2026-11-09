@@ -13,7 +13,7 @@ use axum::{
     routing::post,
 };
 use scheduler_app::{daemon, operator};
-use scheduler_core::{CredentialRef, MAX_FRAME_BYTES, Operation};
+use scheduler_core::{CredentialRef, MAX_FRAME_BYTES, Operation, WorkerAccess};
 use scheduler_platform::{DataPaths, LocalClient};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -166,6 +166,19 @@ impl Panel {
                 operator::save_preferences(&self.preferences, preferences)?;
                 Value::Null
             }
+            "get_scheduler_settings" => operator::scheduler_settings(&self.client()?).await?,
+            "set_scheduler_settings" => {
+                let SchedulerSettingsArgs {
+                    max_concurrent_workers,
+                    worker_access,
+                } = serde_json::from_value(args)?;
+                operator::set_scheduler_settings(
+                    &self.client()?,
+                    max_concurrent_workers,
+                    worker_access,
+                )
+                .await?
+            }
             "choose_project_folder" => {
                 let _guard = self
                     .folder_lock
@@ -237,6 +250,12 @@ fn snapshot(health: Result<Option<Value>>) -> Value {
 #[derive(Deserialize)]
 struct PreferencesArgs {
     preferences: operator::Preferences,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerSettingsArgs {
+    max_concurrent_workers: Option<usize>,
+    worker_access: Option<WorkerAccess>,
 }
 #[derive(Deserialize)]
 struct RootArgs {

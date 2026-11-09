@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use scheduler_core::{
-    AgentKind, DeliveryEnvelope, OriginSession, OriginSource, ParentRoute, ProcessIdentity,
-    ProjectRecord, Registration,
+    AgentKind, DeliveryEnvelope, MainPermission, OriginSession, OriginSource, ParentRoute,
+    ProcessIdentity, ProjectRecord, Registration,
 };
 
 #[derive(Debug, Clone)]
@@ -10,6 +10,7 @@ pub struct ResolvedParent {
     pub route: ParentRoute,
     pub generation: String,
     pub workspace_root: std::path::PathBuf,
+    pub main_permission: Option<MainPermission>,
 }
 
 #[derive(Debug)]

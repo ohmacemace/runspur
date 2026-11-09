@@ -53,6 +53,7 @@ impl ParentAdapter for SimulatedAgent {
             },
             generation: format!("{}-owner", self.id),
             workspace_root: project.root.clone(),
+            main_permission: None,
         })
     }
     async fn deliver(
@@ -281,6 +282,7 @@ impl ParentAdapter for FixtureParent {
             },
             generation: "fixture-generation".into(),
             workspace_root: known.root.clone(),
+            main_permission: None,
         })
     }
     async fn deliver(
@@ -983,7 +985,7 @@ async fn crash_between_completion_file_and_database_commit_is_recovered_without_
         )
         .await
         .unwrap();
-    let spec = harness.app.store.claim_next().await.unwrap().unwrap();
+    let spec = harness.app.store.claim_next(2).await.unwrap().unwrap();
     let completion = Completion {
         schema_version: 1,
         task_id: accepted.task_id.clone(),
@@ -1017,7 +1019,7 @@ async fn crash_between_completion_file_and_database_commit_is_recovered_without_
     assert_eq!(recovered.execution_state, ExecutionState::Succeeded);
     assert_eq!(recovered.result.unwrap().summary, "already completed");
     assert_eq!(recovered.delivery_state, DeliveryState::Pending);
-    assert!(harness.app.store.claim_next().await.unwrap().is_none());
+    assert!(harness.app.store.claim_next(2).await.unwrap().is_none());
     assert_eq!(harness.app.store.due_deliveries(10).await.unwrap().len(), 1);
     harness.app.recover().await.unwrap();
     assert_eq!(harness.app.store.due_deliveries(10).await.unwrap().len(), 1);

@@ -334,6 +334,7 @@ impl ClaudeSessionAdapter {
             },
             generation: generation(&owner),
             workspace_root: project.root.clone(),
+            main_permission: None,
         })
     }
 }

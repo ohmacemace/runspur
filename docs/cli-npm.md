@@ -29,9 +29,11 @@ For headless use, run `runspur start` to start the scheduler in the background a
 
 ## Manage projects and dispatches
 
-Use **Projects** to edit the Agents or permissions of a connected project. Worker access defaults to read-only. Use Claude Code **2.1.319** for workers that need permission to edit task-specific files or text files across the isolated project workspace.
+Use **Projects** to edit the Agents or permissions of a connected project. New projects start read-only. Use Claude Code **2.1.319** for isolated workspace edits. To refresh an existing project's Runspur Skill, preview and save **Edit configuration**, then open a new conversation.
 
 Use **Dispatch history** to find tasks by project and conversation, then inspect their results and delivery status.
+
+Use **Settings** to set the global concurrency limit and child Agent access. Project permissions are the default. **Full access** enables native shell and file tools in the live project. **Follow main Agent** uses verified full or read-only access and falls back to project permissions for other or unavailable modes.
 
 Before uninstalling, finish active tasks and close connected Agent conversations. Stop the scheduler from **Overview** or run `runspur stop`. If the panel is open, press Ctrl+C in the `runspur tui` terminal to close it. Then run `npm uninstall --global runspur`. Project settings and the Runspur state directory are stored separately.
 

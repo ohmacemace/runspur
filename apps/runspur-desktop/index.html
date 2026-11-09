@@ -265,6 +265,29 @@
           </select>
         </div>
         <p id="settings-message" class="settings-message" aria-live="polite"></p>
+        <h2 data-i18n="localScheduler">Local scheduler</h2>
+        <form id="scheduler-settings-form" class="setting-row scheduler-setting" novalidate>
+          <div>
+            <label for="scheduler-limit" data-i18n="schedulerLimit">Maximum concurrent tasks</label>
+            <p id="scheduler-limit-hint" data-i18n="schedulerLimitHint">All projects share this limit. Extra tasks wait in the queue. Lowering the limit lets running tasks finish.</p>
+          </div>
+          <div class="setting-controls">
+            <input id="scheduler-limit" type="number" min="1" max="64" step="1" required aria-describedby="scheduler-limit-hint scheduler-settings-message" disabled>
+            <button id="scheduler-limit-save" type="submit" data-i18n="saveSchedulerLimit" disabled>Save</button>
+          </div>
+        </form>
+        <div class="setting-row scheduler-setting">
+          <div>
+            <label for="worker-access" data-i18n="workerAccess">Child Agent permissions</label>
+            <p id="scheduler-worker-access-hint" data-i18n="schedulerWorkerAccessHint">Full access enables Claude Code's own shell and file tools. Follow main Agent uses the project's permissions when the main Agent's current permissions are unavailable.</p>
+          </div>
+          <select id="worker-access" aria-describedby="scheduler-worker-access-hint scheduler-settings-message" disabled>
+            <option value="project" data-i18n="workerAccessProject">Use project permissions</option>
+            <option value="full" data-i18n="workerAccessFull">Full access</option>
+            <option value="follow_main" data-i18n="workerAccessFollowMain">Follow main Agent</option>
+          </select>
+        </div>
+        <p id="scheduler-settings-message" class="settings-message" aria-live="polite"></p>
       </section>
     </main>
     </div>

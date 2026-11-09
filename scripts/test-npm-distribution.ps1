@@ -147,6 +147,18 @@ try {
     if ($service.status -ne "ready" -or $service.health.version -ne $manifest.version) {
         throw "The browser panel did not start a healthy scheduler."
     }
+    $settings = Invoke-RunspurApi "get_scheduler_settings"
+    if ($settings.max_concurrent_workers -ne 2 -or $settings.worker_access -ne "project") {
+        throw "The browser panel did not report the default scheduler settings."
+    }
+    $settings = Invoke-RunspurApi "set_scheduler_settings" @{ maxConcurrentWorkers = 3 }
+    if ($settings.max_concurrent_workers -ne 3 -or $settings.worker_access -ne "project") {
+        throw "The browser panel did not apply the global concurrency limit."
+    }
+    $settings = Invoke-RunspurApi "set_scheduler_settings" @{ workerAccess = "follow_main" }
+    if ($settings.worker_access -ne "follow_main" -or $settings.max_concurrent_workers -ne 3) {
+        throw "Changing worker access did not preserve the concurrency limit."
+    }
     $started = @(Get-TestSchedulerProcessIds -Program $nativeDaemon -StateDirectory $state)
     if ($started.Count -ne 1) { throw "Expected one isolated scheduler process after browser panel startup." }
     & $control start --data-dir $state | Out-Null
@@ -231,6 +243,10 @@ try {
     $headless = @(Get-TestSchedulerProcessIds -Program $nativeDaemon -StateDirectory $state)
     if ($service.status -ne "ready" -or $headless.Count -ne 1) {
         throw "The headless command did not leave one healthy scheduler."
+    }
+    $settings = Invoke-RunspurApi "get_scheduler_settings"
+    if ($settings.max_concurrent_workers -ne 3 -or $settings.worker_access -ne "follow_main") {
+        throw "The scheduler settings were not restored after restart."
     }
     $service = Invoke-RunspurApi "start_service"
     $reused = @(Get-TestSchedulerProcessIds -Program $nativeDaemon -StateDirectory $state)

@@ -5,7 +5,7 @@ mod project_setup;
 mod service;
 
 use scheduler_app::operator::{self, OperatorProject, Preferences, ProjectPreviews};
-use scheduler_core::TaskDetail;
+use scheduler_core::{TaskDetail, WorkerAccess};
 use serde_json::Value;
 use service::{Service, Snapshot};
 
@@ -30,6 +30,26 @@ fn set_preferences(
     preferences: Preferences,
 ) -> Result<(), String> {
     operator::save_preferences(service.preferences_path(), preferences).map_err(query_error)
+}
+
+#[tauri::command]
+async fn get_scheduler_settings(service: tauri::State<'_, Service>) -> Result<Value, String> {
+    let client = service.operator_client().map_err(query_error)?;
+    operator::scheduler_settings(&client)
+        .await
+        .map_err(query_error)
+}
+
+#[tauri::command]
+async fn set_scheduler_settings(
+    service: tauri::State<'_, Service>,
+    max_concurrent_workers: Option<usize>,
+    worker_access: Option<WorkerAccess>,
+) -> Result<Value, String> {
+    let client = service.operator_client().map_err(query_error)?;
+    operator::set_scheduler_settings(&client, max_concurrent_workers, worker_access)
+        .await
+        .map_err(query_error)
 }
 
 fn query_error(error: anyhow::Error) -> String {
@@ -90,6 +110,8 @@ fn main() {
             start_service,
             get_preferences,
             set_preferences,
+            get_scheduler_settings,
+            set_scheduler_settings,
             projects_list,
             query_sessions,
             query_task_history,

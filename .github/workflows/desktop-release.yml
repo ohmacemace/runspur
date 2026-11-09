@@ -60,7 +60,7 @@ jobs:
       - name: Install Windows app dependencies
         working-directory: apps/runspur-desktop
         run: npm.cmd ci
-      - name: Build NSIS installer
+      - name: Build MSI installer
         working-directory: apps/runspur-desktop
         run: npm.cmd run package:windows -- -- --locked
       - name: Verify installer and stage release files
@@ -69,16 +69,16 @@ jobs:
           RUNSPUR_DESKTOP_VERSION: ${{ steps.release.outputs.version }}
         run: |
           $version = $env:RUNSPUR_DESKTOP_VERSION
-          $bundle = "apps/runspur-desktop/src-tauri/target/release/bundle/nsis"
-          $installers = @(Get-ChildItem -LiteralPath $bundle -Filter '*_x64-setup.exe' -File)
-          if ($installers.Count -ne 1) { throw "Expected exactly one Windows x64 NSIS installer in $bundle." }
+          $bundle = "apps/runspur-desktop/src-tauri/target/release/bundle/msi"
+          $installers = @(Get-ChildItem -LiteralPath $bundle -Filter '*_x64_*.msi' -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows x64 MSI installer in $bundle." }
 
           powershell.exe -NoProfile -File scripts/test-desktop-distribution.ps1 -InstallerPath $installers[0].FullName -ExpectedVersion $version
           if ($LASTEXITCODE -ne 0) { throw "Windows desktop distribution smoke failed." }
 
           $output = Join-Path $env:RUNNER_TEMP "runspur-desktop-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $null = [IO.Directory]::CreateDirectory($output)
-          $name = "Runspur-Desktop-$version-x64-setup.exe"
+          $name = "Runspur-Desktop-$version-x64.msi"
           $installer = Join-Path $output $name
           Copy-Item -LiteralPath $installers[0].FullName -Destination $installer
           $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -112,7 +112,7 @@ jobs:
           RUNSPUR_DESKTOP_VERSION: ${{ needs.package.outputs.version }}
           RUNSPUR_SOURCE_COMMIT: ${{ needs.package.outputs.source_commit }}
         run: |
-          installer="Runspur-Desktop-$RUNSPUR_DESKTOP_VERSION-x64-setup.exe"
+          installer="Runspur-Desktop-$RUNSPUR_DESKTOP_VERSION-x64.msi"
           sha256sum --strict --check SHA256SUMS.txt
           tagged_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)"
           if [[ "$tagged_commit" != "$RUNSPUR_SOURCE_COMMIT" ]]; then
@@ -122,4 +122,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" "$installer" SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
             --title "Runspur Desktop $RUNSPUR_DESKTOP_VERSION" \
-            --notes 'Windows x64 desktop installer and SHA256 checksum. The CLI is distributed separately through [npm](https://www.npmjs.com/package/runspur).'
+            --notes 'Windows x64 desktop MSI installer and SHA256 checksum. The CLI is distributed separately through [npm](https://www.npmjs.com/package/runspur).'

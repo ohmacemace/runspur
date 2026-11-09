@@ -266,6 +266,7 @@ impl CodexDesktopAdapter {
         Ok(ResolvedParent {
             generation: scheduler_core::fingerprint(&generation)?,
             workspace_root: actual,
+            main_permission: active_main_permission(&snapshot),
             route: ParentRoute {
                 adapter_id: self.id().into(),
                 session_id: origin.provider_session_id.clone(),
@@ -442,9 +443,129 @@ async fn nearest_project(cwd: &std::path::Path) -> Result<Option<ProjectConfig>>
     Ok(None)
 }
 
+fn active_main_permission(snapshot: &Value) -> Option<MainPermission> {
+    let turn = if snapshot["turnHistory"]["kind"] == "canonical" {
+        let history = &snapshot["turnHistory"]["history"];
+        let island = history["islands"].as_array()?.last()?;
+        if island["newerBoundary"]["status"] != "exhausted" {
+            return None;
+        }
+        let key = island["entries"].as_array()?.last()?["value"].as_str()?;
+        history["entitiesByKey"].get(key)?
+    } else {
+        snapshot["turns"].as_array()?.last()?
+    };
+    if turn["status"] != "inProgress"
+        || turn["turnId"].as_str().is_none_or(str::is_empty)
+        || turn["pendingUserMessageAdmission"] == true
+    {
+        return None;
+    }
+    let turn_permissions = &turn["params"];
+    let current_permissions = &snapshot["currentPermissions"];
+    let turn_mode = permission_mode(turn_permissions, turn_permissions["permissions"].as_str());
+    let current_mode = permission_mode(
+        current_permissions,
+        current_permissions["activePermissionProfile"]["id"].as_str(),
+    );
+    // A reconstructed turn can reuse earlier parameters. Full access requires the
+    // admitted turn and the owner's current permissions to agree.
+    match (turn_mode, current_mode) {
+        (Some(MainPermission::ReadOnly), _) | (_, Some(MainPermission::ReadOnly)) => {
+            Some(MainPermission::ReadOnly)
+        }
+        (Some(MainPermission::Full), Some(MainPermission::Full)) => Some(MainPermission::Full),
+        (None, None) => None,
+        _ => Some(MainPermission::Restricted),
+    }
+}
+
+fn permission_mode(permissions: &Value, profile: Option<&str>) -> Option<MainPermission> {
+    match (permissions["sandboxPolicy"]["type"].as_str(), profile) {
+        (Some("readOnly"), _) | (_, Some(":read-only")) => Some(MainPermission::ReadOnly),
+        (Some("dangerFullAccess"), None | Some(":danger-full-access"))
+        | (None, Some(":danger-full-access")) => Some(MainPermission::Full),
+        (None, None) => None,
+        _ => Some(MainPermission::Restricted),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_access_requires_agreement_with_the_admitted_active_turn() {
+        let mut turn = json!({
+            "turnId": "current-turn",
+            "status": "inProgress",
+            "params": {"permissions": ":danger-full-access"}
+        });
+        let permission = json!({
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+            "activePermissionProfile": {"id": ":danger-full-access"}
+        });
+        let legacy = |turn: &Value| {
+            json!({
+                "turns": [turn],
+                "currentPermissions": permission
+            })
+        };
+        let canonical = json!({
+            "turns": [],
+            "currentPermissions": permission,
+            "turnHistory": {"kind": "canonical", "history": {
+                "islands": [{"newerBoundary": {"status": "exhausted"}, "entries": [{"value": "current"}]}],
+                "entitiesByKey": {"current": turn}
+            }}
+        });
+        assert_eq!(
+            active_main_permission(&legacy(&turn)),
+            Some(MainPermission::Full)
+        );
+        assert_eq!(
+            active_main_permission(&canonical),
+            Some(MainPermission::Full)
+        );
+        let mut history_with_gap = canonical;
+        history_with_gap["turnHistory"]["history"]["islands"][0]["newerBoundary"]["status"] =
+            json!("available");
+        assert_eq!(active_main_permission(&history_with_gap), None);
+
+        turn["params"] = json!({"sandboxPolicy": {"type": "readOnly"}});
+        assert_eq!(
+            active_main_permission(&legacy(&turn)),
+            Some(MainPermission::ReadOnly)
+        );
+        turn["params"] = json!({"permissions": ":workspace"});
+        assert_eq!(
+            active_main_permission(&legacy(&turn)),
+            Some(MainPermission::Restricted)
+        );
+        turn["params"] = json!({"sandboxPolicy": {"type": "dangerFullAccess"}});
+        let mut different = legacy(&turn);
+        different["currentPermissions"] = json!({"sandboxPolicy": {"type": "workspaceWrite"}});
+        assert_eq!(
+            active_main_permission(&different),
+            Some(MainPermission::Restricted)
+        );
+        different["currentPermissions"] = json!({"sandboxPolicy": {"type": "readOnly"}});
+        assert_eq!(
+            active_main_permission(&different),
+            Some(MainPermission::ReadOnly)
+        );
+
+        turn["pendingUserMessageAdmission"] = json!(true);
+        assert_eq!(active_main_permission(&legacy(&turn)), None);
+        turn["pendingUserMessageAdmission"] = json!(false);
+        turn["status"] = json!("completed");
+        assert_eq!(active_main_permission(&legacy(&turn)), None);
+        assert_eq!(
+            active_main_permission(&json!({"currentPermissions": permission})),
+            None
+        );
+    }
+
     #[test]
     fn native_data_shapes_preserve_result_role_and_required_text_arrays() {
         let text = NativeTextInput {

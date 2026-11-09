@@ -11,6 +11,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const PROJECT_FILE: &str = ".agent-scheduler/project.json";
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_RESULT_BYTES: usize = 128 * 1024;
+pub const MAX_SCHEDULER_WORKERS: usize = 64;
 
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -40,6 +41,7 @@ impl Default for IntegrationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchLimits {
+    // Retained for manifest compatibility and existing project revision fingerprints.
     pub max_concurrent_workers: u32,
     pub max_dispatches_per_root: u32,
     pub default_timeout_seconds: u32,
@@ -93,6 +95,45 @@ pub enum AgentKind {
     CodexExec,
     ClaudePrint,
     Probe,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerAccess {
+    #[default]
+    Project,
+    Full,
+    FollowMain,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MainPermission {
+    Full,
+    ReadOnly,
+    Restricted,
+}
+
+impl WorkerAccess {
+    pub fn permits_native_full(self, main: Option<MainPermission>, kind: &AgentKind) -> bool {
+        self.allows_native_full(main)
+            && matches!(kind, AgentKind::ClaudePrint | AgentKind::CodexExec)
+    }
+
+    pub(crate) fn allows_native_full(self, main: Option<MainPermission>) -> bool {
+        self == Self::Full || (self == Self::FollowMain && main == Some(MainPermission::Full))
+    }
+
+    pub(crate) fn inherits_read_only(self, main: Option<MainPermission>) -> bool {
+        self == Self::FollowMain && main == Some(MainPermission::ReadOnly)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerSettings {
+    pub max_concurrent_workers: usize,
+    #[serde(default)]
+    pub worker_access: WorkerAccess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +346,12 @@ pub struct QueuedTask {
     pub execution_mode: ExecutionMode,
     #[serde(default)]
     pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub native_full: bool,
+    #[serde(default)]
+    pub main_permission: Option<MainPermission>,
+    #[serde(default)]
+    pub access_revoked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
