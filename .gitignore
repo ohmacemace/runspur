@@ -11,6 +11,7 @@ runspur-*.tgz
 .playwright-cli/
 /output/playwright/
 /scripts/test-desktop-install.ps1
+/scripts/windows-desktop-smoke.cjs
 /.claude/settings.local.json
 
 # Project policy is versioned; local state and credentials are not.

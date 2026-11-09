@@ -48,8 +48,6 @@ jobs:
         run: cargo test --workspace --locked
       - name: Build programs
         run: cargo build --workspace --locked
-      - name: Check Codex desktop host test syntax
-        run: node --check scripts/windows-desktop-smoke.cjs
       - name: Validate PowerShell scripts
         run: powershell.exe -NoProfile -File scripts/check-powershell.ps1
       - name: Install browser panel dependencies
