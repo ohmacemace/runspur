@@ -11,7 +11,7 @@ Runspur coordinates work between Codex and Claude Code. The main Agent can deleg
 - Inspect each dispatch, its result, and its delivery status by project or conversation.
 - Use the CLI or the Windows app to connect projects and manage their configuration.
 
-Runspur supports **Windows x64**. Claude Code **2.1.319 or later** is required for either Agent role. Automatic delivery has been verified with a specific Codex desktop distribution and native Claude Code CLI sessions. Claude Desktop is untested. [Compatibility details](#compatibility)
+Runspur supports **Windows x64**. Claude Code **2.1.319 or later** is required for either Agent role. Use **2.1.319** for a Claude Code worker that needs write access. Automatic delivery has been verified with a specific Codex desktop distribution and native Claude Code CLI sessions. Claude Desktop is untested. [Compatibility details](#compatibility)
 
 ## Quick start
 
@@ -24,13 +24,13 @@ npm install --global runspur
 runspur tui
 ```
 
-`runspur tui` opens the Runspur workspace in your default browser. The panel runs on your computer and uses the same Projects, History, Overview, and Settings screens as the Windows app. Install the Agent CLIs you plan to use, then open **Projects → Add project**, select the folder and Agent roles, and review the integration before saving.
+`runspur tui` opens the Runspur workspace in your default browser. The panel runs on your computer and uses the same interface as the Windows app. Install the Agent CLIs you plan to use, then open **Projects → Add project**, select the folder and Agent roles, and review the integration before saving.
 
 To edit an existing project, find it in **Projects** and choose **Edit configuration**. One scheduler serves all projects and starts automatically when needed. If PowerShell blocks the npm-generated script shims, use `npm.cmd` and `runspur.cmd tui`.
 
 Use `runspur start` to start the scheduler in the background. It returns to the terminal once the scheduler is ready. Use `runspur stop` to stop the same scheduler.
 
-Before updating or uninstalling, finish active tasks, close connected Agent conversations, and stop the scheduler from **Overview** or with `runspur stop`. Press Ctrl+C in the panel terminal to close the local panel, then run `npm update --global runspur` or `npm uninstall --global runspur`. Project settings and task history are stored separately from the npm installation.
+Before uninstalling, finish active tasks, close connected Agent conversations, and stop the scheduler from **Overview** or with `runspur stop`. Press Ctrl+C in the panel terminal to close the local panel, then run `npm uninstall --global runspur`. Project settings and task history are stored separately from the npm installation.
 
 #### Delegate a task
 
@@ -59,8 +59,8 @@ New projects start with read-only workers. The two write modes use a verified Cl
 | Mode | Project setting | What the worker can do |
 | --- | --- | --- |
 | `read_only` | Read only (default) | Inspect the project |
-| `workspace_write` | Edit specified files | Create or edit files explicitly named in the task's `write_scope` |
-| `project_write` | Edit across the project | Create or edit UTF-8 text files across the project using the file tools. The task omits `write_scope` |
+| `workspace_write` | Specified files | Create or edit files explicitly named in the task's `write_scope` |
+| `project_write` | Project-wide text edits | Create or edit UTF-8 text files across the project using the file tools. The task omits `write_scope` |
 
 Project-wide authorization also allows tasks with a narrower `write_scope`. The main Agent chooses the execution mode for each task from the modes exposed by `scheduler_agents`.
 
@@ -78,7 +78,7 @@ Both write modes save changes to the isolated workspace and record them in `chan
 | `scheduler_claim` | Retrieve the result named in a Claude Code native inbox notification, using `delivery_id` in the originating conversation |
 | `scheduler_ack` | Confirm consumption using `delivery_id` and `ack_nonce` |
 
-Open **History** and select a project and conversation to see its dispatches. A dispatch shows the original instructions, worker, result or failure, and delivery status. The browser panel and Windows app query the same local scheduler.
+Open **Dispatch history** and select a project and conversation to see its dispatches. A dispatch shows the original instructions, worker, result or failure, and delivery status. The browser panel and Windows app query the same local scheduler.
 
 The defaults allow two concurrent workers globally and per project, with a one-hour task timeout. The project manifest controls project limits.
 
@@ -115,7 +115,7 @@ The verified desktop baseline is `OpenAI.Codex 26.1103.4239.0`, with core `0.167
 
 ## Build and test
 
-Source builds require Rust stable, the Windows MSVC target, and Visual Studio C++ Build Tools.
+Source builds require Rust stable, the Windows MSVC target, and Visual Studio C++ Build Tools. Building the shared interface uses Node.js 24 and npm, matching Windows CI.
 
 ```powershell
 cargo fmt --all --check
@@ -136,21 +136,21 @@ Use the executable bundled with Codex desktop for `--codex-core` and an existing
 
 ### Package the CLI for npm
 
-Build on Windows x64, then use the version shown in the generated filename to test the tarball.
+Build on Windows x64. The smoke test below uses the current release version. For later releases, use the archive path printed by the packaging script.
 
 ```powershell
 cargo build --locked --release -p scheduler-app -p runspur-cli --bins
 npm --prefix apps/runspur-desktop ci
 npm --prefix apps/runspur-desktop run ui:build
 .\scripts\package-npm.ps1
-.\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-<version>.tgz
+.\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-0.1.2.tgz
 ```
 
 The package version comes from Cargo. A maintainer publishes the verified tarball with `npm.cmd publish` and completes npm account verification. The same tarball supports offline installation with `npm.cmd install --global`.
 
 ### Build the Windows desktop app
 
-Runspur Desktop ships with its scheduler. The installed app uses the same default scheduler data directory as the CLI, `%LOCALAPPDATA%\Runspur\Runspur\data`, and connects to the running scheduler when available. Build the x64 Windows installer with Rust, MSVC Build Tools, Node.js, npm, and WebView2.
+Runspur Desktop ships with its scheduler. The installed app uses the same default scheduler data directory as the CLI, `%LOCALAPPDATA%\Runspur\Runspur\data`. Keep both clients on the same version to share a running scheduler. Build the x64 Windows installer with Rust, MSVC Build Tools, Node.js 24, npm, and WebView2.
 
 ```powershell
 cargo build --locked --release -p scheduler-app --bins

@@ -11,7 +11,7 @@ Runspur 协调 Codex 和 Claude Code 之间的工作。主 Agent 派发任务后
 - 按项目或会话查看每次派发的内容、结果和回传状态。
 - 通过 CLI 或 Windows 应用接入项目并管理配置。
 
-Runspur 支持 **Windows x64**。Claude Code 担任主 Agent 或子 Agent 时，要求 **2.1.319 或更新版本**。自动回传已在指定的 Codex 桌面版和 Claude Code CLI 原生会话中验证。Claude Desktop 尚未测试。[兼容性详情](#兼容性)
+Runspur 支持 **Windows x64**。Claude Code 担任主 Agent 或子 Agent 时，要求 **2.1.319 或更新版本**。Claude Code 子 Agent 需要写入权限时，请使用 **2.1.319**。自动回传已在指定的 Codex 桌面版和 Claude Code CLI 原生会话中验证。Claude Desktop 尚未测试。[兼容性详情](#兼容性)
 
 ## 快速开始
 
@@ -24,13 +24,13 @@ npm install --global runspur
 runspur tui
 ```
 
-`runspur tui` 会在默认浏览器中打开本机 Runspur 面板，与 Windows 应用共用项目、历史、概览和设置界面。先安装计划使用的 Agent CLI，再到**项目 → 添加项目**，选择目录、主 Agent、子 Agent 和权限。预览接入配置后确认保存。
+`runspur tui` 会在默认浏览器中打开本机 Runspur 面板，与 Windows 应用共用界面。先安装计划使用的 Agent CLI，再到**项目 → 添加项目**，选择目录、主 Agent、子 Agent 和权限。预览接入配置后确认保存。
 
 修改已有项目时，在**项目**列表找到它，再点**编辑配置**。多个项目共用同一个调度器，需要时自动启动。如果 PowerShell 阻止执行 npm 生成的脚本，可以使用 `npm.cmd` 和 `runspur.cmd tui`。
 
 只需要后台调度时，运行 `runspur start`。调度器就绪后，命令会返回终端。用 `runspur stop` 停止同一个调度器。
 
-更新或卸载前，等正在运行的任务结束，关闭已接入的 Agent 会话，再在**概览**或用 `runspur stop` 停止调度器。在面板所在终端按 Ctrl+C 关闭本机面板，之后执行 `npm update --global runspur` 或 `npm uninstall --global runspur`。项目配置和任务历史保存在独立目录。
+卸载前，等正在运行的任务结束，关闭已接入的 Agent 会话，再在**概览**或用 `runspur stop` 停止调度器。在面板所在终端按 Ctrl+C 关闭本机面板，之后执行 `npm uninstall --global runspur`。项目配置和任务历史保存在独立目录。
 
 #### 派发任务
 
@@ -59,8 +59,8 @@ Windows 桌面应用使用独立的 NSIS 安装包。从源码构建安装包并
 | 模式 | 项目设置 | 子 Agent 可以做什么 |
 | --- | --- | --- |
 | `read_only` | 只读（默认） | 查看项目 |
-| `workspace_write` | 修改指定文件 | 新建或修改任务 `write_scope` 列出的文件 |
-| `project_write` | 在项目范围内修改 | 通过文件工具在项目范围内新建或修改 UTF-8 文本文件，任务省略 `write_scope` |
+| `workspace_write` | 指定文件写入 | 新建或修改任务 `write_scope` 列出的文件 |
+| `project_write` | 项目内写入 | 通过文件工具在项目范围内新建或修改 UTF-8 文本文件，任务省略 `write_scope` |
 
 项目范围的授权也允许主 Agent 派发指定文件的写入任务。主 Agent 根据每项任务需要，从 `scheduler_agents` 提供的模式中选择。
 
@@ -80,7 +80,7 @@ Windows 桌面应用使用独立的 NSIS 安装包。从源码构建安装包并
 | `scheduler_claim` | Claude Code 原会话收到本地通知后，用 `delivery_id` 读取结果 |
 | `scheduler_ack` | 用 `delivery_id` 和 `ack_nonce` 确认已消费的结果 |
 
-在**历史**中选择项目和会话，查看原始指令、执行的子 Agent、结果或失败原因及回传状态。浏览器面板和 Windows 应用查询同一个本机调度器。
+在**调度历史**中选择项目和会话，查看原始指令、执行的子 Agent、结果或失败原因及回传状态。浏览器面板和 Windows 应用查询同一个本机调度器。
 
 ## 状态、恢复和产物
 
@@ -124,6 +124,8 @@ Codex 桌面回传已验证 `OpenAI.Codex 26.1103.4239.0` 和核心 `0.167.0-alp
 
 ## 开发和复核
 
+源码构建需要 Rust stable、Windows MSVC 目标和 Visual Studio C++ Build Tools。共享界面使用 Node.js 24 和 npm 构建，与 Windows CI 一致。
+
 ```powershell
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -147,28 +149,29 @@ node .\scripts\windows-desktop-smoke.cjs --codex-core "C:\path\to\desktop-core\c
 crates/scheduler-core/       模型、权限、协议、SQLite store
 crates/scheduler-platform/   Windows IPC、用户身份、凭据、进程树与目录
 crates/scheduler-runtime/    worker、父回传适配器、调度、outbox、恢复
-crates/scheduler-app/        daemon、CLI、MCP、项目集成与进程测试
+crates/scheduler-app/        调度器、MCP、项目接入和进程测试
+apps/runspur-cli/           npm 命令与本机网页服务
 scripts/                    显式桌面冒烟
 apps/runspur-desktop/       Windows 桌面应用
 ```
 
 ### 打包 CLI
 
-在 Windows x64 上构建并打包 CLI，版本号来自 Cargo。将打包生成的 `.tgz` 路径传给测试脚本。
+在 Windows x64 上构建并打包 CLI。下面的命令使用当前发布版本。打包后续版本时，将脚本打印的压缩包路径传给测试脚本。
 
 ```powershell
 cargo build --locked --release -p scheduler-app -p runspur-cli --bins
 npm --prefix apps/runspur-desktop ci
 npm --prefix apps/runspur-desktop run ui:build
 .\scripts\package-npm.ps1
-.\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-<version>.tgz
+.\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-0.1.2.tgz
 ```
 
 维护者用 `npm.cmd publish` 发布验证过的压缩包，并完成 npm 账号验证。同一份包也可以通过 `npm.cmd install --global` 离线安装。
 
 ### 构建 Windows 桌面应用
 
-需要 Rust、MSVC Build Tools、Node.js、npm 和 WebView2。
+需要 Rust、MSVC Build Tools、Node.js 24、npm 和 WebView2。
 
 ```powershell
 cargo build --locked --release -p scheduler-app --bins
@@ -177,7 +180,7 @@ npm ci
 npm run package:windows
 ```
 
-安装包生成在 `src-tauri/target/release/bundle/nsis/`。安装版与 CLI 共用默认数据目录 `%LOCALAPPDATA%\Runspur\Runspur\data`。用 `npm run dev` 启动的开发版使用独立的 `%LOCALAPPDATA%\Runspur\state\desktop-dev`。
+安装包生成在 `src-tauri/target/release/bundle/nsis/`。安装版与 CLI 共用默认数据目录 `%LOCALAPPDATA%\Runspur\Runspur\data`。同时使用两端时，请保持版本一致以复用运行中的调度器。用 `npm run dev` 启动的开发版使用独立的 `%LOCALAPPDATA%\Runspur\state\desktop-dev`。
 
 ## 参与贡献
 
