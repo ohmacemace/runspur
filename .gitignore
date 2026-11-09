@@ -1,21 +1,28 @@
 # Build and release output
 /target/
 /dist/
+node_modules/
+runspur-*.tgz
 **/*.rs.bk
 
 # Local development instructions, checks, and output.
 /AGENTS.md
 /.runspur-local/
+.playwright-cli/
+/output/playwright/
 /scripts/test-desktop-install.ps1
+/.claude/settings.local.json
 
 # Project policy is versioned; local state and credentials are not.
 /.agent-scheduler/local/
-/artifacts/
+artifacts/
 /state/
 **/.runspur-state-version
 **/scheduler.sqlite3
 **/scheduler.sqlite3-*
 **/credentials/*.dpapi
+*.browser-settings.json
+.npmrc
 .env
 .env.*
 !.env.example

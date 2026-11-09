@@ -1,0 +1,125 @@
+name: Release Runspur Desktop
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build and verify Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 35
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify release tag
+        id: release
+        run: |
+          $config = Get-Content -LiteralPath apps/runspur-desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = $config.version
+          if (-not $version -or $env:GITHUB_REF_TYPE -ne "tag" -or $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Expected release tag v$version, received $env:GITHUB_REF_NAME."
+          }
+          $source = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Cannot identify the source commit." }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "source_commit=$source" >> $env:GITHUB_OUTPUT
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/runspur-desktop/package-lock.json
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Cache Rust release builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: desktop-release
+          workspaces: |
+            .
+            apps/runspur-desktop/src-tauri
+      - name: Build release scheduler sidecars
+        run: cargo build --locked --release -p scheduler-app --bins
+      - name: Install Windows app dependencies
+        working-directory: apps/runspur-desktop
+        run: npm.cmd ci
+      - name: Build NSIS installer
+        working-directory: apps/runspur-desktop
+        run: npm.cmd run package:windows -- -- --locked
+      - name: Verify installer and stage release files
+        id: stage
+        env:
+          RUNSPUR_DESKTOP_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $version = $env:RUNSPUR_DESKTOP_VERSION
+          $bundle = "apps/runspur-desktop/src-tauri/target/release/bundle/nsis"
+          $installers = @(Get-ChildItem -LiteralPath $bundle -Filter '*_x64-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows x64 NSIS installer in $bundle." }
+
+          powershell.exe -NoProfile -File scripts/test-desktop-distribution.ps1 -InstallerPath $installers[0].FullName -ExpectedVersion $version
+          if ($LASTEXITCODE -ne 0) { throw "Windows desktop distribution smoke failed." }
+
+          $output = Join-Path $env:RUNNER_TEMP "runspur-desktop-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $null = [IO.Directory]::CreateDirectory($output)
+          $name = "Runspur-Desktop-$version-x64-setup.exe"
+          $installer = Join-Path $output $name
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $installer
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $output "SHA256SUMS.txt"), "$hash  $name" + [char]10, [Text.Encoding]::ASCII)
+          "path=$output" >> $env:GITHUB_OUTPUT
+      - name: Upload verified Windows desktop installer
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runspur-desktop-windows-x64
+          path: ${{ steps.stage.outputs.path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified installer to GitHub Releases
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified installer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: release
+          merge-multiple: true
+      - name: Verify and publish release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNSPUR_DESKTOP_VERSION: ${{ needs.package.outputs.version }}
+          RUNSPUR_SOURCE_COMMIT: ${{ needs.package.outputs.source_commit }}
+        run: |
+          installer="Runspur-Desktop-$RUNSPUR_DESKTOP_VERSION-x64-setup.exe"
+          sha256sum --strict --check SHA256SUMS.txt
+          tagged_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)"
+          if [[ "$tagged_commit" != "$RUNSPUR_SOURCE_COMMIT" ]]; then
+            echo "The release tag no longer points to the verified source commit." >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$installer" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "Runspur Desktop $RUNSPUR_DESKTOP_VERSION" \
+            --notes 'Windows x64 desktop installer and SHA256 checksum. The CLI is distributed separately through [npm](https://www.npmjs.com/package/runspur).'
