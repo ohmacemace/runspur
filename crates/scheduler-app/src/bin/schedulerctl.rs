@@ -48,7 +48,7 @@ enum Command {
         /// Main Agent product (codex or claude-code), or a configured profile ID.
         #[arg(long)]
         main_agent: Option<String>,
-        /// Comma-separated worker profile IDs. Discover profiles with the profiles command.
+        /// Comma-separated worker profile IDs, such as claude-cli or codex-cli.
         #[arg(long, value_delimiter = ',')]
         workers: Option<Vec<String>>,
         #[arg(long, value_enum)]

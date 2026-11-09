@@ -131,7 +131,12 @@ export function createProjects(
       profiles.find((profile) => profile.profile_id === id)?.kind) ?? [];
     const readOnlyWorkers = selectedKinds.length > 0
       && selectedKinds.every((kind) => kind === 'codex_exec');
+    if (draft && readOnlyWorkers) {
+      draft.allow_workspace_write = false;
+      draft.allow_project_write = false;
+    }
     writeFields.forEach((field) => {
+      field.checked = draft ? field.value === writeAccess(draft) : false;
       field.disabled = !ready || busy || (readOnlyWorkers && field.value !== 'read_only');
     });
     const normalHint = selectedKinds.includes('codex_exec') ? 'codexReadOnlyHint' : 'workerAccessHint';
@@ -225,8 +230,6 @@ export function createProjects(
       apply.textContent = text(draft.registered ? 'saveProjectChanges' : 'applyProject');
       rootPath.textContent = pathLabel(draft.root);
       nameField.value = draft.name;
-      const access = writeAccess(draft);
-      writeFields.forEach((field) => { field.checked = field.value === access; });
       const mainProfiles = parents();
       const parentId = draft.main_agent_profile_id;
       const mainOptions = mainProfiles.map(({ profile_id, kind }) => new Option(profileName(profile_id, kind), profile_id));

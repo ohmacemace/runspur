@@ -393,6 +393,7 @@ pub async fn prepare_project_configuration(
     let adapter = project_adapter(
         &roles.main_agent_profile_id,
         &roles.worker_profile_ids,
+        roles.allow_workspace_write || roles.allow_project_write,
         &profiles,
     )
     .await?;
@@ -402,6 +403,7 @@ pub async fn prepare_project_configuration(
 async fn project_adapter(
     main: &str,
     workers: &BTreeSet<String>,
+    allow_writes: bool,
     profiles: &[AgentProfile],
 ) -> Result<ProjectAdapter> {
     if workers.is_empty() {
@@ -412,18 +414,24 @@ async fn project_adapter(
         .find(|profile| profile.profile_id == main && desktop_parent_profile(profile))
         .context("Select an available main agent.")?;
     let adapter = ProjectAdapter::for_kind(&main.kind)?;
+    let mut has_writable_worker = false;
     for id in workers {
-        if !profiles.iter().any(|profile| {
-            &profile.profile_id == id
-                && !matches!(
-                    (adapter, &profile.kind),
-                    (ProjectAdapter::Codex, AgentKind::CodexExec)
-                        | (ProjectAdapter::Claude, AgentKind::ClaudePrint)
-                )
-                && desktop_worker_profile(profile)
-        }) {
-            bail!("Worker profile is unavailable for this project: {id}");
-        }
+        let worker = profiles
+            .iter()
+            .find(|profile| {
+                &profile.profile_id == id
+                    && !matches!(
+                        (adapter, &profile.kind),
+                        (ProjectAdapter::Codex, AgentKind::CodexExec)
+                            | (ProjectAdapter::Claude, AgentKind::ClaudePrint)
+                    )
+                    && desktop_worker_profile(profile)
+            })
+            .with_context(|| format!("Worker profile is unavailable for this project: {id}"))?;
+        has_writable_worker |= worker.kind == AgentKind::ClaudePrint;
+    }
+    if allow_writes && !has_writable_worker {
+        bail!("The selected workers support read-only tasks. Select read-only permission.");
     }
     if adapter == ProjectAdapter::Claude {
         let program = main
@@ -513,6 +521,8 @@ impl ProjectSetup {
         let adapter = project_adapter(
             &self.record.config.main_agent_profile_id,
             &self.record.config.allowed_worker_profile_ids,
+            self.record.config.limits.allow_workspace_write
+                || self.record.config.limits.allow_project_write,
             &profiles,
         )
         .await?;
@@ -937,6 +947,32 @@ mod tests {
             integrations: IntegrationConfig::default(),
             limits: DispatchLimits::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn configuration_rejects_write_permissions_for_codex_only_workers() {
+        let executable = std::env::current_exe().unwrap();
+        let profiles = [
+            AgentProfile {
+                profile_id: "claude-cli".into(),
+                kind: AgentKind::ClaudePrint,
+                program: Some(executable.clone()),
+                model: None,
+                reasoning_effort: None,
+                environment_keys: Default::default(),
+            },
+            AgentProfile {
+                profile_id: "codex-cli".into(),
+                kind: AgentKind::CodexExec,
+                program: Some(executable),
+                model: None,
+                reasoning_effort: None,
+                environment_keys: Default::default(),
+            },
+        ];
+        let result =
+            project_adapter("claude-cli", &["codex-cli".into()].into(), true, &profiles).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("read-only")));
     }
 
     #[tokio::test]
