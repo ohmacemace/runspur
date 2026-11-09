@@ -2,8 +2,7 @@
 param()
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path $PSScriptRoot -Parent
-$scripts = @(Get-Item -LiteralPath (Join-Path $root "install.ps1")) + @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter "*.ps1" -File)
+$scripts = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter "*.ps1" -File)
 foreach ($script in $scripts) {
     $tokens = $null
     $errors = $null

@@ -41,14 +41,15 @@ function Uninstall-TestApp {
     param([string]$Program, [string]$Directory)
 
     Invoke-Nsis -Program $Program -Arguments '/S'
-    # NSIS can copy the uninstaller to a temp executable before removing the install.
+    # The temporary uninstaller removes the directory before deleting its registration.
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ((Test-Path -LiteralPath $Directory) -and $clock.Elapsed.TotalSeconds -lt 30) {
+    do {
+        $directoryPresent = Test-Path -LiteralPath $Directory
+        $registrationPresent = @(Get-RunspurRegistration).Count -ne 0
+        if (-not $directoryPresent -and -not $registrationPresent) { return }
         Start-Sleep -Milliseconds 250
-    }
-    if ((Test-Path -LiteralPath $Directory) -or @(Get-RunspurRegistration).Count -ne 0) {
-        throw 'Silent uninstall left the installation directory or registry entry.'
-    }
+    } while ($clock.Elapsed.TotalSeconds -lt 30)
+    throw "Silent uninstall did not finish (directory present: $directoryPresent, registration present: $registrationPresent)."
 }
 
 function Get-InstalledScheduler {
