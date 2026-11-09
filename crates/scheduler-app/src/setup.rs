@@ -1295,6 +1295,8 @@ mod tests {
             generated.contains("consider both built-in subagents and permitted Runspur workers")
         );
         assert!(generated.contains("use both for distinct work"));
+        assert!(generated.contains("You are accountable for the final deliverable"));
+        assert!(generated.contains("Verify material claims"));
         assert!(generated.contains("Omit `timeout_seconds` by default"));
         assert!(generated.contains("# Worker routing notes"));
         assert!(generated.contains("claude-cli.md"));
