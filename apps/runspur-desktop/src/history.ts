@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isDesktop } from './api';
 import { element, label, showNotice, type Notice, type Translate } from './dom';
 import type { Message } from './i18n';
 import type { ProjectRecord } from './projects';
@@ -90,7 +90,7 @@ export function createHistory(text: Translate) {
   let detailNotice: Notice | undefined;
 
   function selectedClaudeSession() {
-    if (!projectId || !originId) return;
+    if (!isDesktop || !projectId || !originId) return;
     const record = projects.find(({ config }) => config.project_id === projectId);
     if (record?.main_agent_kind !== 'claude_print') return;
     const origin = sessions.find(({ origin_id }) => origin_id === originId);

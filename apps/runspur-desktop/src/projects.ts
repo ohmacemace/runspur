@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from './api';
 import { element, label, pathLabel, showNotice, type Notice, type Translate } from './dom';
 import type { Message } from './i18n';
 

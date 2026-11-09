@@ -2,5 +2,6 @@
 
 pub mod daemon;
 pub mod mcp;
+pub mod operator;
 pub mod probe;
 pub mod setup;

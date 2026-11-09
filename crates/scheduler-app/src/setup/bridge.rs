@@ -70,12 +70,11 @@ fn packaged_bridge(program: &str) -> bool {
     }) else {
         return false;
     };
+    let cli = format!("runspur{suffix}");
     let control = format!("schedulerctl{suffix}");
-    if !bundle.join(&control).is_file() {
-        return false;
-    }
-    npm_bundle(bundle, &control)
-        || (bundle.join(format!("schedulerd{suffix}")).is_file()
+    (bundle.join(&cli).is_file() && npm_bundle(bundle, &cli))
+        || (bundle.join(&control).is_file()
+            && bundle.join(format!("schedulerd{suffix}")).is_file()
             && (bundle.join(format!("runspur-desktop{suffix}")).is_file()
                 || bundle.join(".runspur-install.json").is_file()))
 }

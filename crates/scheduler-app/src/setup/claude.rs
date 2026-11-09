@@ -311,7 +311,7 @@ mod tests {
         let bundle = package.join("native");
         let suffix = std::env::consts::EXE_SUFFIX;
         tokio::fs::create_dir_all(&bundle).await.unwrap();
-        for binary in ["schedulerctl", "scheduler-mcp"] {
+        for binary in ["runspur", "scheduler-mcp"] {
             tokio::fs::write(bundle.join(format!("{binary}{suffix}")), b"fixture")
                 .await
                 .unwrap();
@@ -319,7 +319,7 @@ mod tests {
         let program = bundle.join(format!("scheduler-mcp{suffix}"));
         let program = program.to_str().unwrap();
         let metadata =
-            json!({"name":"runspur", "bin":{"runspur":format!("native/schedulerctl{suffix}")}});
+            json!({"name":"runspur", "bin":{"runspur":format!("native/runspur{suffix}")}});
         tokio::fs::write(
             package.join("package.json"),
             serde_json::to_vec(&metadata).unwrap(),

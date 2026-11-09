@@ -2813,7 +2813,6 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
- "tempfile",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -2889,6 +2888,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml_edit 0.25.19+spec-1.1.0",

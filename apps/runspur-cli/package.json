@@ -1,7 +1,7 @@
 {
   "name": "runspur",
   "version": "0.0.0",
-  "description": "Runspur Agent scheduler CLI, daemon, and MCP bridge for Windows x64",
+  "description": "Runspur Agent scheduler and local browser panel for Windows x64",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -10,8 +10,8 @@
   "os": ["win32"],
   "cpu": ["x64"],
   "bin": {
-    "runspur": "native/schedulerctl.exe"
+    "runspur": "native/runspur.exe"
   },
-  "files": ["native/*.exe", "THIRD_PARTY_NOTICES.txt"],
+  "files": ["native/*.exe", "web/", "THIRD_PARTY_NOTICES.txt"],
   "private": true
 }

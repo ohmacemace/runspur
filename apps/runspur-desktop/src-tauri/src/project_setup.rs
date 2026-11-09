@@ -1,55 +1,16 @@
-use std::{
-    collections::BTreeSet,
-    env,
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
+use std::{env, ffi::OsStr, path::PathBuf};
 
 use anyhow::{Context, Result};
-use scheduler_app::setup::{
-    ProjectRoles, ProjectSetup, ProjectSetupPreview, desktop_parent_profile,
-    desktop_worker_profile, prepare_project_configuration, read_project_at_root, seed_profiles,
+use scheduler_app::{
+    operator::{self, OperatorProfile, PreviewReply, ProjectDraft, ProjectPreviews},
+    setup::{desktop_parent_profile, read_project_at_root},
 };
-use scheduler_core::{AgentKind, AgentProfile, Operation, ProjectRecord, fingerprint, new_id};
-use serde::{Deserialize, Serialize};
+use scheduler_core::{AgentKind, AgentProfile, Operation, ProjectRecord, fingerprint};
 use tauri::{State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 
 use crate::{console, query_error, service::Service};
-
-#[derive(Default)]
-pub(crate) struct ProjectPreviews(Mutex<Option<(String, ProjectSetup)>>);
-
-#[derive(Deserialize, Serialize)]
-pub(crate) struct ProjectDraft {
-    root: PathBuf,
-    #[serde(default)]
-    registered: bool,
-    name: String,
-    main_agent_profile_id: String,
-    worker_profile_ids: BTreeSet<String>,
-    allow_workspace_write: bool,
-    #[serde(default)]
-    allow_project_write: bool,
-}
-
-#[derive(Serialize)]
-pub(crate) struct DesktopProfile {
-    profile_id: String,
-    kind: AgentKind,
-    parent: bool,
-    worker: bool,
-}
-
-#[derive(Serialize)]
-pub(crate) struct PreviewReply {
-    token: String,
-    allow_workspace_write: bool,
-    allow_project_write: bool,
-    #[serde(flatten)]
-    preview: ProjectSetupPreview,
-}
 
 fn bundled_executable(name: &str) -> Result<PathBuf> {
     let path = env::current_exe()
@@ -83,64 +44,9 @@ pub(crate) async fn choose_project_folder(
 #[tauri::command]
 pub(crate) async fn agent_profiles(
     service: State<'_, Service>,
-) -> Result<Vec<DesktopProfile>, String> {
+) -> Result<Vec<OperatorProfile>, String> {
     let client = service.operator_client().map_err(query_error)?;
-    let profiles = seed_profiles(&client).await.map_err(query_error)?;
-    Ok(profiles
-        .into_iter()
-        .filter_map(|profile| {
-            let parent = desktop_parent_profile(&profile);
-            let worker = desktop_worker_profile(&profile);
-            (parent || worker).then_some(DesktopProfile {
-                profile_id: profile.profile_id,
-                kind: profile.kind,
-                parent,
-                worker,
-            })
-        })
-        .collect())
-}
-
-async fn read_draft(service: &Service, root: &Path) -> Result<ProjectDraft> {
-    let root = tokio::fs::canonicalize(root)
-        .await
-        .context("Cannot open project folder")?;
-    let manifest = read_project_at_root(&root).await?;
-    let client = service.operator_client()?;
-    let records: Vec<ProjectRecord> =
-        serde_json::from_value(client.call(Operation::ListProjects).await?)?;
-    let registered_config = records
-        .into_iter()
-        .find(|record| record.root == root)
-        .map(|record| record.config);
-    let registered = registered_config.is_some();
-    Ok(match manifest.or(registered_config) {
-        Some(config) => ProjectDraft {
-            root,
-            registered,
-            name: config.name,
-            main_agent_profile_id: config.main_agent_profile_id,
-            worker_profile_ids: config.allowed_worker_profile_ids,
-            allow_workspace_write: config.limits.allow_workspace_write,
-            allow_project_write: config.limits.allow_project_write,
-        },
-        None => {
-            let name = root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Runspur project")
-                .to_owned();
-            ProjectDraft {
-                root,
-                registered: false,
-                name,
-                main_agent_profile_id: "codex-desktop".into(),
-                worker_profile_ids: BTreeSet::new(),
-                allow_workspace_write: false,
-                allow_project_write: false,
-            }
-        }
-    })
+    operator::agent_profiles(&client).await.map_err(query_error)
 }
 
 #[tauri::command]
@@ -148,7 +54,10 @@ pub(crate) async fn project_read(
     service: State<'_, Service>,
     root: PathBuf,
 ) -> Result<ProjectDraft, String> {
-    read_draft(&service, &root).await.map_err(query_error)
+    let client = service.operator_client().map_err(query_error)?;
+    operator::project_read(&client, &root)
+        .await
+        .map_err(query_error)
 }
 
 #[tauri::command]
@@ -207,34 +116,14 @@ pub(crate) async fn project_preview(
     previews: State<'_, ProjectPreviews>,
     input: ProjectDraft,
 ) -> Result<PreviewReply, String> {
-    let mut pending = previews.0.lock().await;
-    *pending = None;
     let client = service.operator_client().map_err(query_error)?;
-    let mcp = bundled_executable("scheduler-mcp.exe").map_err(query_error)?;
-    let program = mcp
-        .to_str()
-        .ok_or("The bundled MCP path is not valid Unicode")?;
-    let allow_workspace_write = input.allow_workspace_write || input.allow_project_write;
-    let roles = ProjectRoles {
-        name: input.name,
-        main_agent_profile_id: input.main_agent_profile_id,
-        worker_profile_ids: input.worker_profile_ids,
-        allow_workspace_write,
-        allow_project_write: input.allow_project_write,
-    };
-    let plan =
-        prepare_project_configuration(&client, &input.root, |_| roles, program, &client.paths.root)
-            .await
-            .map_err(query_error)?;
-    let token = new_id();
-    let preview = plan.preview();
-    *pending = Some((token.clone(), plan));
-    Ok(PreviewReply {
-        token,
-        allow_workspace_write,
-        allow_project_write: input.allow_project_write,
-        preview,
-    })
+    let program = env::current_exe()
+        .context("Cannot locate Runspur Desktop")
+        .map_err(query_error)?
+        .with_file_name("scheduler-mcp.exe");
+    operator::project_preview(&client, &previews, input, &program)
+        .await
+        .map_err(query_error)
 }
 
 #[tauri::command]
@@ -244,9 +133,7 @@ pub(crate) async fn project_apply(
     token: String,
 ) -> Result<ProjectRecord, String> {
     let client = service.operator_client().map_err(query_error)?;
-    let mut pending = previews.0.lock().await;
-    let Some((_, plan)) = pending.take_if(|(expected, _)| expected == &token) else {
-        return Err("Preview the project changes again before confirming.".into());
-    };
-    plan.apply(&client).await.map_err(query_error)
+    operator::project_apply(&client, &previews, &token)
+        .await
+        .map_err(query_error)
 }

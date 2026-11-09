@@ -32,6 +32,8 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/runspur-desktop/package-lock.json
       - name: Install Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -50,7 +52,14 @@ jobs:
         run: node --check scripts/windows-desktop-smoke.cjs
       - name: Validate PowerShell scripts
         run: powershell.exe -NoProfile -File scripts/check-powershell.ps1
+      - name: Install browser panel dependencies
+        working-directory: apps/runspur-desktop
+        run: npm.cmd ci
+      - name: Build browser panel
+        working-directory: apps/runspur-desktop
+        run: npm.cmd run ui:build
       - name: Pack and test the Windows x64 npm CLI
+        timeout-minutes: 5
         run: |
           $output = Join-Path $env:RUNNER_TEMP "runspur-npm-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           ./scripts/package-npm.ps1 -BinaryDir target/debug -OutputDir $output

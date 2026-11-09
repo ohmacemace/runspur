@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "apps/runspur-cli",
     "crates/scheduler-core",
     "crates/scheduler-platform",
     "crates/scheduler-runtime",

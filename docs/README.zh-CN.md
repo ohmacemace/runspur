@@ -21,19 +21,16 @@ CLI 通过 npm 以 `runspur` 包发行，0.1.2 版支持 Windows x64。安装 No
 
 ```powershell
 npm install --global runspur
-runspur new
+runspur tui
 ```
 
-向导会依次询问项目目录、项目名称、主 Agent、子 Agent 和文件权限。需要时会自动启动共享的后台调度器。预览接入配置后确认保存。运行向导前，请先安装计划使用的 Agent CLI。
+`runspur tui` 会在默认浏览器中打开本机 Runspur 面板，与 Windows 应用共用项目、历史、概览和设置界面。先安装计划使用的 Agent CLI，再到**项目 → 添加项目**，选择目录、主 Agent、子 Agent 和权限。预览接入配置后确认保存。
 
-继续运行 `runspur new` 可以接入其他项目。已有项目用 `runspur edit` 修改配置，`runspur --help` 可查看命令。如果 PowerShell 阻止执行 npm 生成的脚本，可以使用 `npm.cmd` 和 `runspur.cmd`。
+修改已有项目时，在**项目**列表找到它，再点**编辑配置**。多个项目共用同一个调度器，需要时自动启动。如果 PowerShell 阻止执行 npm 生成的脚本，可以使用 `npm.cmd` 和 `runspur.cmd tui`。
 
-```powershell
-runspur projects
-runspur edit
-```
+只需要后台调度时，运行 `runspur start`。调度器就绪后，命令会返回终端。用 `runspur stop` 停止同一个调度器。
 
-更新或卸载前先执行 `runspur stop`，再用 `npm update --global runspur` 或 `npm uninstall --global runspur`。项目配置和任务历史保存在独立目录。
+更新或卸载前，等正在运行的任务结束，关闭已接入的 Agent 会话，再在**概览**或用 `runspur stop` 停止调度器。在面板所在终端按 Ctrl+C 关闭本机面板，之后执行 `npm update --global runspur` 或 `npm uninstall --global runspur`。项目配置和任务历史保存在独立目录。
 
 #### 派发任务
 
@@ -53,25 +50,25 @@ Windows 桌面应用使用独立的 NSIS 安装包。从源码构建安装包并
 
 每个项目的主 Agent、子 Agent 和权限保存在 `.agent-scheduler/project.json`。Runspur 会预览接入变更并保留宿主原有的其他设置。子 Agent 通过对应厂商的 CLI 执行，需与主 Agent 来自不同厂商。
 
-使用 `runspur edit` 选择并修改项目。自动化场景可用 `runspur configure --project-root <目录>` 预览指定项目的配置，省略的字段保留原值，加 `--apply` 保存。可用参数见 `runspur configure --help`。
+在**项目**列表选择项目并编辑配置。保存前可以预览新的 Skill、MCP 配置和 Runspur 将清理的接入条目。
 
 ### 选择子 Agent 权限
 
 项目默认只读。两种写入模式都使用已验证的 Claude Code 2.1.319 子 Agent，并在独立任务工作区保存改动。
 
-| 模式 | CLI 项目设置 | 子 Agent 可以做什么 |
+| 模式 | 项目设置 | 子 Agent 可以做什么 |
 | --- | --- | --- |
-| `read_only` | `--permission read-only`（默认） | 查看项目 |
-| `workspace_write` | `--permission workspace-write` | 新建或修改任务 `write_scope` 列出的文件 |
-| `project_write` | `--permission project-write` | 通过文件工具在项目范围内新建或修改 UTF-8 文本文件，任务省略 `write_scope` |
+| `read_only` | 只读（默认） | 查看项目 |
+| `workspace_write` | 修改指定文件 | 新建或修改任务 `write_scope` 列出的文件 |
+| `project_write` | 在项目范围内修改 | 通过文件工具在项目范围内新建或修改 UTF-8 文本文件，任务省略 `write_scope` |
 
 项目范围的授权也允许主 Agent 派发指定文件的写入任务。主 Agent 根据每项任务需要，从 `scheduler_agents` 提供的模式中选择。
 
 两种写入模式都生成改动文件和 `changes.json`。文件工具限制访问边界，主 Agent 审阅后在授权范围内将改动应用到原项目。
 
-默认全局和每个项目各允许两个子 Agent 并发执行，任务超时为一小时。项目限制可在清单中调整。以前台方式启动调度器时，可用 `runspur start --max-workers` 指定全局并发数。
+默认全局和每个项目各允许两个子 Agent 并发执行，任务超时为一小时。项目限制可在清单中调整。
 
-## 工具和管理命令
+## Agent 工具和派发历史
 
 | MCP 工具 | 作用 |
 | --- | --- |
@@ -83,21 +80,7 @@ Windows 桌面应用使用独立的 NSIS 安装包。从源码构建安装包并
 | `scheduler_claim` | Claude Code 原会话收到本地通知后，用 `delivery_id` 读取结果 |
 | `scheduler_ack` | 用 `delivery_id` 和 `ack_nonce` 确认已消费的结果 |
 
-本机操作者可以跨会话查看与取消，但不能冒充父 Agent 消费确认：
-
-```powershell
-runspur projects
-runspur sessions --project <project-id>
-runspur tasks --project <project-id> --origin <origin-id>
-runspur task <task-id>
-runspur status
-runspur status <task-id>
-runspur cancel <task-id>
-```
-
-`sessions` 列出项目中有派发记录的会话。将返回的 `origin_id` 传给 `tasks --origin`，按原会话查看子 Agent、执行状态和回传状态。旧的 `--session` 参数适用于宿主会话 ID 在项目内可以唯一定位的情况。用 `task` 读取原始指令、结果或失败原因及回传详情。列表可使用 `next_cursor` 作为下一页的 `--before` 参数。CLI 与 Windows 应用共用查询接口。
-
-`scheduler-mcp` 使用 stdio；不要直接在其 stdout 打印诊断文本。
+在**历史**中选择项目和会话，查看原始指令、执行的子 Agent、结果或失败原因及回传状态。浏览器面板和 Windows 应用查询同一个本机调度器。
 
 ## 状态、恢复和产物
 
@@ -174,7 +157,9 @@ apps/runspur-desktop/       Windows 桌面应用
 在 Windows x64 上构建并打包 CLI，版本号来自 Cargo。将打包生成的 `.tgz` 路径传给测试脚本。
 
 ```powershell
-cargo build --locked --release -p scheduler-app --bins
+cargo build --locked --release -p scheduler-app -p runspur-cli --bins
+npm --prefix apps/runspur-desktop ci
+npm --prefix apps/runspur-desktop run ui:build
 .\scripts\package-npm.ps1
 .\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-<version>.tgz
 ```

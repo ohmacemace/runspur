@@ -14,6 +14,7 @@ rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml_edit.workspace = true
@@ -26,5 +27,4 @@ scheduler-runtime = { path = "../scheduler-runtime" }
 
 [dev-dependencies]
 async-trait.workspace = true
-tempfile.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }

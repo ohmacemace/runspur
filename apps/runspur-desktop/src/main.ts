@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isDesktop } from './api';
 import { element } from './dom';
 import { createHistory } from './history';
 import { messages, resolveLocale, type Language, type Message } from './i18n';
@@ -12,7 +12,7 @@ type Health = {
 };
 
 type Preferences = { language: Language };
-type ServiceCommand = 'service_status' | 'start_service';
+type ServiceCommand = 'service_status' | 'start_service' | 'stop_service';
 
 type Snapshot = {
   channel: 'installed' | 'development';
@@ -28,6 +28,7 @@ const indicator = element('indicator');
 const channel = element('channel');
 const refresh = element<HTMLButtonElement>('refresh');
 const start = element<HTMLButtonElement>('start');
+const stop = element<HTMLButtonElement>('stop');
 const languageSetting = element<HTMLSelectElement>('language-setting');
 const settingsMessage = element('settings-message');
 let preferences: Preferences | undefined;
@@ -63,10 +64,12 @@ function renderService() {
   element('rail-status').textContent = text(railMessages[state]);
   start.hidden = state === 'ready' || state === 'pending';
   start.textContent = text(state === 'error' ? 'retry' : 'start');
+  stop.hidden = isDesktop || state !== 'ready';
 
   switch (state) {
     case 'pending':
-      status.textContent = text(pending === 'start_service' ? 'starting' : 'checking');
+      status.textContent = text(pending === 'start_service' ? 'starting'
+        : pending === 'stop_service' ? 'stopping' : 'checking');
       detail.textContent = '';
       break;
     case 'ready':
@@ -86,7 +89,7 @@ function renderService() {
 
 async function update(command: ServiceCommand) {
   pending = command;
-  refresh.disabled = start.disabled = true;
+  refresh.disabled = start.disabled = stop.disabled = true;
   renderService();
   try {
     snapshot = await invoke<Snapshot>(command);
@@ -96,7 +99,7 @@ async function update(command: ServiceCommand) {
     connectionError = String(error);
   } finally {
     pending = undefined;
-    refresh.disabled = start.disabled = false;
+    refresh.disabled = start.disabled = stop.disabled = false;
     renderService();
     const ready = snapshot?.status === 'ready';
     history.setReady(ready);
@@ -106,6 +109,7 @@ async function update(command: ServiceCommand) {
 
 refresh.addEventListener('click', () => { void update('service_status'); });
 start.addEventListener('click', () => { void update('start_service'); });
+if (!isDesktop) stop.addEventListener('click', () => { void update('stop_service'); });
 
 const pages = ['projects', 'history', 'overview', 'settings'] as const;
 function showPage(page: typeof pages[number]) {

@@ -21,19 +21,16 @@ The CLI is distributed through npm as `runspur`. Version 0.1.2 supports Windows 
 
 ```powershell
 npm install --global runspur
-runspur new
+runspur tui
 ```
 
-The setup wizard asks for the project folder, name, main Agent, child Agents, and file permissions. It starts the shared scheduler in the background when needed. Review the project integration and confirm to save. Install the Agent CLIs you plan to use before running the wizard.
+`runspur tui` opens the Runspur workspace in your default browser. The panel runs on your computer and uses the same Projects, History, Overview, and Settings screens as the Windows app. Install the Agent CLIs you plan to use, then open **Projects → Add project**, select the folder and Agent roles, and review the integration before saving.
 
-Run `runspur new` again to connect another project. Use `runspur edit` to change an existing project's configuration. Run `runspur --help` for commands. If PowerShell blocks the npm-generated script shims, use `npm.cmd` and `runspur.cmd`.
+To edit an existing project, find it in **Projects** and choose **Edit configuration**. One scheduler serves all projects and starts automatically when needed. If PowerShell blocks the npm-generated script shims, use `npm.cmd` and `runspur.cmd tui`.
 
-```powershell
-runspur projects
-runspur edit
-```
+Use `runspur start` to start the scheduler in the background. It returns to the terminal once the scheduler is ready. Use `runspur stop` to stop the same scheduler.
 
-Use `runspur stop` before updating with `npm update --global runspur` or uninstalling with `npm uninstall --global runspur`. Project settings and task history are stored separately from the npm installation.
+Before updating or uninstalling, finish active tasks, close connected Agent conversations, and stop the scheduler from **Overview** or with `runspur stop`. Press Ctrl+C in the panel terminal to close the local panel, then run `npm update --global runspur` or `npm uninstall --global runspur`. Project settings and task history are stored separately from the npm installation.
 
 #### Delegate a task
 
@@ -53,23 +50,23 @@ Use **Settings → Language** to follow the system language or select English or
 
 The project stores its Agent choices and permission policy in `.agent-scheduler/project.json`. Runspur previews project integration changes and preserves unrelated host settings. Select child Agents from a different provider than the main Agent. Child Agents run through their provider's CLI.
 
-Use `runspur edit` to select and change a project interactively. For automation, `runspur configure --project-root <folder>` previews changes to the specified project and preserves any fields you omit. Add `--apply` to save. `runspur configure --help` lists the available flags.
+Open **Projects** and edit the chosen project's configuration. Preview the new Skill, MCP configuration, and any entries Runspur will remove before saving.
 
 ### Choose worker permissions
 
 New projects start with read-only workers. The two write modes use a verified Claude Code 2.1.319 worker and a separate task workspace.
 
-| Mode | CLI project setting | What the worker can do |
+| Mode | Project setting | What the worker can do |
 | --- | --- | --- |
-| `read_only` | `--permission read-only` (default) | Inspect the project |
-| `workspace_write` | `--permission workspace-write` | Create or edit files explicitly named in the task's `write_scope` |
-| `project_write` | `--permission project-write` | Create or edit UTF-8 text files across the project using the file tools. The task omits `write_scope` |
+| `read_only` | Read only (default) | Inspect the project |
+| `workspace_write` | Edit specified files | Create or edit files explicitly named in the task's `write_scope` |
+| `project_write` | Edit across the project | Create or edit UTF-8 text files across the project using the file tools. The task omits `write_scope` |
 
 Project-wide authorization also allows tasks with a narrower `write_scope`. The main Agent chooses the execution mode for each task from the modes exposed by `scheduler_agents`.
 
 Both write modes save changes to the isolated workspace and record them in `changes.json`. The file tools enforce the project boundary, and the main Agent reviews and applies authorized changes to the original project.
 
-## Tools and commands
+## Agent tools and history
 
 | MCP tool | Purpose |
 | --- | --- |
@@ -81,23 +78,9 @@ Both write modes save changes to the isolated workspace and record them in `chan
 | `scheduler_claim` | Retrieve the result named in a Claude Code native inbox notification, using `delivery_id` in the originating conversation |
 | `scheduler_ack` | Confirm consumption using `delivery_id` and `ack_nonce` |
 
-Local operator commands:
+Open **History** and select a project and conversation to see its dispatches. A dispatch shows the original instructions, worker, result or failure, and delivery status. The browser panel and Windows app query the same local scheduler.
 
-```powershell
-runspur projects
-runspur sessions --project <project-id>
-runspur tasks --project <project-id> --origin <origin-id>
-runspur task <task-id>
-runspur status
-runspur status <task-id>
-runspur cancel <task-id>
-```
-
-`sessions` lists conversations with dispatches in the project. Pass its `origin_id` to `tasks --origin` to filter dispatches by their original conversation. `--session` accepts legacy host session IDs when they identify a single origin in the project. Pass `next_cursor` to `--before` to read the next page with the same filters. `task` returns the prompt, original conversation, result or failure, and delivery details. The CLI and Windows app use the same operator queries.
-
-Operator access permits inspection and cancellation across conversations, but cannot impersonate a parent's consumption acknowledgment. `scheduler-mcp` uses stdio; its stdout is reserved for MCP messages.
-
-The defaults allow two concurrent workers globally and per project, with a one-hour task timeout. The project manifest controls project limits. To set a different global concurrency limit for a foreground scheduler, use `runspur start --max-workers`.
+The defaults allow two concurrent workers globally and per project, with a one-hour task timeout. The project manifest controls project limits.
 
 ## Reliability model
 
@@ -156,7 +139,9 @@ Use the executable bundled with Codex desktop for `--codex-core` and an existing
 Build on Windows x64, then use the version shown in the generated filename to test the tarball.
 
 ```powershell
-cargo build --locked --release -p scheduler-app --bins
+cargo build --locked --release -p scheduler-app -p runspur-cli --bins
+npm --prefix apps/runspur-desktop ci
+npm --prefix apps/runspur-desktop run ui:build
 .\scripts\package-npm.ps1
 .\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-<version>.tgz
 ```

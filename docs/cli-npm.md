@@ -1,6 +1,6 @@
 # Runspur CLI
 
-Runspur lets Codex and Claude Code delegate work to each other and sends results back to the conversation that started the task. The Windows x64 npm package includes the Runspur CLI, scheduler, and MCP bridge.
+Runspur lets Codex and Claude Code delegate work to each other and sends results back to the conversation that started the task. The Windows x64 npm package includes the Runspur CLI, scheduler, MCP bridge, and local browser panel.
 
 ## Install
 
@@ -13,30 +13,26 @@ runspur --version
 
 If PowerShell blocks script shims, use `npm.cmd` and `runspur.cmd`.
 
-## Connect a project
+## Open the panel
 
-Run the setup wizard. Runspur starts the local scheduler in the background as needed.
+Run the following to open the panel in your browser. Runspur starts the local scheduler as needed.
 
 ```powershell
-runspur new
+runspur tui
 ```
 
-Choose the project folder, main Agent, available child Agents, and file permissions. Review the settings and confirm to connect the project. Open a new conversation in the configured host to load the project's Skill and MCP tools.
+In **Projects**, add an existing folder and select the main Agent, child Agents, and file permissions. Review the configuration and confirm to connect the project. Open a new conversation in the configured host to load the project's Skill and MCP tools.
 
 Automatic result delivery is verified on the supported Codex desktop distribution and on native Claude Code CLI sessions. Claude Code requires version 2.1.319 or later. Claude Desktop is untested.
 
+For headless use, run `runspur start` to start the scheduler in the background and `runspur stop` to stop it. Each command returns when the scheduler reaches the requested state.
+
 ## Manage projects and dispatches
 
-Run `runspur edit` and choose a connected project to change its Agents or permissions. Leave a selection blank to keep its current setting, then review and confirm the changes. Worker access defaults to read-only for new projects. A supported Claude Code worker can be authorized to edit task-specific files or text files across the isolated project workspace.
+Use **Projects** to edit the Agents or permissions of a connected project. Worker access defaults to read-only. A supported Claude Code worker can edit task-specific files or text files across the isolated project workspace when authorized.
 
-For scripts, pass the project folder explicitly. Omit `--apply` to preview. The write modes are `--permission workspace-write` and `--permission project-write`.
+Use **Dispatch history** to find tasks by project and conversation, then inspect their results and delivery status.
 
-```powershell
-runspur configure --project-root 'C:\path\your-project' --main-agent codex --workers claude-cli
-```
-
-Use `runspur projects`, `runspur sessions --project <project-id>`, and `runspur tasks --project <project-id>` to locate a dispatch. Use `runspur task <task-id>` to inspect its result and delivery status.
-
-Before updating or removing the package, finish active tasks, close connected Agent conversations, and run `runspur stop`. Then run `npm update --global runspur` or `npm uninstall --global runspur`. Project settings and the Runspur state directory are stored separately.
+Before updating or removing the package, finish active tasks and close connected Agent conversations. Stop the scheduler from **Overview** or run `runspur stop`. If the panel is open, press Ctrl+C in the `runspur tui` terminal to close it. Then run `npm update --global runspur` or `npm uninstall --global runspur`. Project settings and the Runspur state directory are stored separately.
 
 [Full usage and source](https://github.com/ohmacemace/runspur) · [简体中文](https://github.com/ohmacemace/runspur/blob/main/docs/README.zh-CN.md)

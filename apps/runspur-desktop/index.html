@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="/src-tauri/icons/icon.svg?no-inline" />
-    <title>Runspur Desktop</title>
+    <title>Runspur</title>
   </head>
   <body>
     <header class="app-header">
@@ -228,7 +228,7 @@
           <div class="connection-status">
             <strong id="status">Checking connection</strong>
           </div>
-          <p id="detail">Checking the scheduler included with Runspur Desktop.</p>
+          <p id="detail">Checking the local Runspur scheduler.</p>
         </div>
         <dl class="readout">
           <div><dt data-i18n="serviceVersion">Service version</dt><dd id="version">—</dd></div>
@@ -237,6 +237,7 @@
         </dl>
         <div class="actions">
           <button id="start" type="button" hidden>Start scheduler</button>
+          <button id="stop" class="secondary" type="button" data-i18n="stop" hidden>Stop scheduler</button>
         </div>
       </section>
       <section id="settings" aria-labelledby="settings-title" hidden>
@@ -247,7 +248,7 @@
         <div class="setting-row">
           <div>
             <label for="language-setting" data-i18n="language">Language</label>
-            <p id="language-hint" data-i18n="languageHint">Choose the language used by Runspur Desktop.</p>
+            <p id="language-hint" data-i18n="languageHint">Choose the language used by Runspur.</p>
           </div>
           <select id="language-setting" aria-describedby="language-hint" disabled>
             <option value="system" data-i18n="systemLanguage">Use system language</option>

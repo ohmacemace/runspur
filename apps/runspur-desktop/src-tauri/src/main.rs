@@ -3,13 +3,11 @@
 mod console;
 mod project_setup;
 mod service;
-mod settings;
 
-use scheduler_core::{AgentKind, AgentProfile, Operation, ProjectRecord, TaskDetail};
-use serde::Serialize;
+use scheduler_app::operator::{self, OperatorProject, Preferences, ProjectPreviews};
+use scheduler_core::TaskDetail;
 use serde_json::Value;
 use service::{Service, Snapshot};
-use settings::Preferences;
 
 #[tauri::command]
 async fn service_status(service: tauri::State<'_, Service>) -> Result<Snapshot, ()> {
@@ -23,7 +21,7 @@ async fn start_service(service: tauri::State<'_, Service>) -> Result<Snapshot, (
 
 #[tauri::command]
 fn get_preferences(service: tauri::State<'_, Service>) -> Result<Preferences, String> {
-    settings::load(service.preferences_path()).map_err(|error| format!("{error:#}"))
+    operator::load_preferences(service.preferences_path()).map_err(query_error)
 }
 
 #[tauri::command]
@@ -31,47 +29,17 @@ fn set_preferences(
     service: tauri::State<'_, Service>,
     preferences: Preferences,
 ) -> Result<(), String> {
-    settings::save(service.preferences_path(), preferences).map_err(|error| format!("{error:#}"))
+    operator::save_preferences(service.preferences_path(), preferences).map_err(query_error)
 }
 
 fn query_error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-async fn query(service: &Service, operation: Operation) -> Result<Value, String> {
-    service
-        .operator_client()
-        .map_err(query_error)?
-        .call(operation)
-        .await
-        .map_err(query_error)
-}
-
 #[tauri::command]
-async fn projects_list(service: tauri::State<'_, Service>) -> Result<Vec<DesktopProject>, String> {
-    let projects: Vec<ProjectRecord> =
-        serde_json::from_value(query(&service, Operation::ListProjects).await?)
-            .map_err(|error| error.to_string())?;
-    let profiles: Vec<AgentProfile> =
-        serde_json::from_value(query(&service, Operation::ListProfiles).await?)
-            .map_err(|error| error.to_string())?;
-    Ok(projects
-        .into_iter()
-        .map(|record| DesktopProject {
-            main_agent_kind: profiles
-                .iter()
-                .find(|profile| profile.profile_id == record.config.main_agent_profile_id)
-                .map(|profile| profile.kind.clone()),
-            record,
-        })
-        .collect())
-}
-
-#[derive(Serialize)]
-struct DesktopProject {
-    #[serde(flatten)]
-    record: ProjectRecord,
-    main_agent_kind: Option<AgentKind>,
+async fn projects_list(service: tauri::State<'_, Service>) -> Result<Vec<OperatorProject>, String> {
+    let client = service.operator_client().map_err(query_error)?;
+    operator::projects_list(&client).await.map_err(query_error)
 }
 
 #[tauri::command]
@@ -81,15 +49,10 @@ async fn query_sessions(
     before: Option<i64>,
     limit: u32,
 ) -> Result<Value, String> {
-    query(
-        &service,
-        Operation::ListSessions {
-            project_id,
-            before,
-            limit,
-        },
-    )
-    .await
+    let client = service.operator_client().map_err(query_error)?;
+    operator::query_sessions(&client, project_id, before, limit)
+        .await
+        .map_err(query_error)
 }
 
 #[tauri::command]
@@ -100,22 +63,10 @@ async fn query_task_history(
     before: Option<i64>,
     limit: u32,
 ) -> Result<Value, String> {
-    let operation = if let Some(origin_id) = origin_id {
-        Operation::OriginTaskHistory {
-            project_id: project_id.ok_or("An origin filter requires a project")?,
-            origin_id,
-            before,
-            limit,
-        }
-    } else {
-        Operation::TaskHistory {
-            project_id,
-            session_id: None,
-            before,
-            limit,
-        }
-    };
-    query(&service, operation).await
+    let client = service.operator_client().map_err(query_error)?;
+    operator::query_task_history(&client, project_id, origin_id, before, limit)
+        .await
+        .map_err(query_error)
 }
 
 #[tauri::command]
@@ -123,10 +74,8 @@ async fn query_task_detail(
     service: tauri::State<'_, Service>,
     task_id: String,
 ) -> Result<TaskDetail, String> {
-    service
-        .operator_client()
-        .map_err(query_error)?
-        .task_detail(&task_id)
+    let client = service.operator_client().map_err(query_error)?;
+    operator::query_task_detail(&client, &task_id)
         .await
         .map_err(query_error)
 }
@@ -135,7 +84,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Service::current_user().expect("resolve Runspur Desktop state directory"))
-        .manage(project_setup::ProjectPreviews::default())
+        .manage(ProjectPreviews::default())
         .invoke_handler(tauri::generate_handler![
             service_status,
             start_service,

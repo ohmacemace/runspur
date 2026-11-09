@@ -27,30 +27,46 @@ struct Health {
 
 /// Use the compatible scheduler for this state directory, starting it in the background if absent.
 pub async fn connect(root: &Path) -> Result<LocalClient> {
+    connect_with(root, None).await
+}
+
+pub async fn connect_bundled(root: &Path, program: &Path) -> Result<LocalClient> {
+    connect_with(root, Some(program)).await
+}
+
+pub async fn health(root: &Path) -> Result<Option<serde_json::Value>> {
+    Ok(probe(root).await?.map(|(_, health)| health))
+}
+
+async fn connect_with(root: &Path, program: Option<&Path>) -> Result<LocalClient> {
     let root = std::path::absolute(root)?;
-    if let Some(client) = probe(&root).await? {
+    if let Some((client, _)) = probe(&root).await? {
         return Ok(client);
     }
-    start_background(&root).await
+    start_background(&root, program).await
 }
 
 #[cfg(windows)]
-async fn start_background(root: &Path) -> Result<LocalClient> {
+async fn start_background(root: &Path, bundled: Option<&Path>) -> Result<LocalClient> {
     use std::ffi::OsStr;
 
-    let program = std::env::current_exe().context("Cannot locate the Runspur CLI executable")?;
-    let child = scheduler_platform::spawn_background(
-        &program,
-        &[
-            OsStr::new("start"),
-            OsStr::new("--data-dir"),
-            root.as_os_str(),
-        ],
-    )
-    .context("Cannot start the Runspur scheduler in the background")?;
+    let current_exe;
+    let mut args = Vec::with_capacity(3);
+    let program = match bundled {
+        Some(program) => program,
+        None => {
+            current_exe =
+                std::env::current_exe().context("Cannot locate the Runspur executable")?;
+            args.push(OsStr::new("start"));
+            &current_exe
+        }
+    };
+    args.extend([OsStr::new("--data-dir"), root.as_os_str()]);
+    let child = scheduler_platform::spawn_background(program, &args)
+        .context("Cannot start the Runspur scheduler in the background")?;
     let ready = tokio::time::timeout(START_TIMEOUT, async {
         loop {
-            if let Some(client) = probe(root).await? {
+            if let Some((client, _)) = probe(root).await? {
                 return Ok(client);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -60,9 +76,7 @@ async fn start_background(root: &Path) -> Result<LocalClient> {
     match ready {
         Ok(result) => result,
         Err(_) => match child.try_wait()? {
-            Some(status) => bail!(
-                "Runspur scheduler exited with {status} before becoming ready. Run `runspur start` to see startup errors."
-            ),
+            Some(status) => bail!("Runspur scheduler exited with {status} before becoming ready."),
             None => bail!(
                 "Runspur scheduler did not become ready within {} seconds",
                 START_TIMEOUT.as_secs()
@@ -73,7 +87,7 @@ async fn start_background(root: &Path) -> Result<LocalClient> {
 
 /// Stop the scheduler for this directory and wait until its executable and pipe are released.
 pub async fn stop(root: &Path) -> Result<()> {
-    let Some(client) = probe(root).await? else {
+    let Some((client, _)) = probe(root).await? else {
         return Ok(());
     };
     tokio::time::timeout(STOP_TIMEOUT, async {
@@ -93,7 +107,7 @@ pub async fn stop(root: &Path) -> Result<()> {
     .context("Runspur scheduler did not stop within 30 seconds")?
 }
 
-async fn probe(root: &Path) -> Result<Option<LocalClient>> {
+async fn probe(root: &Path) -> Result<Option<(LocalClient, serde_json::Value)>> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -126,7 +140,7 @@ async fn probe(root: &Path) -> Result<Option<LocalClient>> {
         Err(error) if is_missing_pipe(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let health: Health = serde_json::from_value(value).context("Invalid scheduler health data")?;
+    let health = Health::deserialize(&value).context("Invalid scheduler health data")?;
     if health.protocol_version != WIRE_VERSION || health.version != env!("CARGO_PKG_VERSION") {
         bail!(
             "The running scheduler is version {} (protocol {}). This Runspur CLI requires version {} (protocol {}).",
@@ -136,7 +150,7 @@ async fn probe(root: &Path) -> Result<Option<LocalClient>> {
             WIRE_VERSION,
         );
     }
-    Ok(Some(client))
+    Ok(Some((client, value)))
 }
 
 fn is_missing_pipe(error: &anyhow::Error) -> bool {
@@ -147,7 +161,7 @@ fn is_missing_pipe(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-async fn start_background(_root: &Path) -> Result<LocalClient> {
+async fn start_background(_root: &Path, _program: Option<&Path>) -> Result<LocalClient> {
     bail!("The Runspur background scheduler is supported on Windows")
 }
 
