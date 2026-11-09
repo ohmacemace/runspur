@@ -154,7 +154,21 @@ pub(super) async fn prepare(
         let installed = installed_bridge(current, desired, &config_path).transpose()?.context(
             "Existing runspur_scheduler MCP entry differs; refusing to overwrite user configuration",
         )?;
-        let entry = mcp_entry(installed, config.integrations.mcp);
+        let bridge = if is_generated_mcp_entry(current) {
+            installed.updated(desired)
+        } else {
+            installed
+        };
+        let entry = mcp_entry(bridge, config.integrations.mcp);
+        if bridge.program != installed.program {
+            let command = current
+                .get_mut("command")
+                .and_then(toml_edit::Item::as_value_mut)
+                .context("Existing Runspur bridge command is invalid")?;
+            let mut replacement = toml_edit::Value::from(desired.program);
+            *replacement.decor_mut() = command.decor().clone();
+            *command = replacement;
+        }
         current.insert("enabled", toml_edit::value(config.integrations.mcp));
         entry
     } else {

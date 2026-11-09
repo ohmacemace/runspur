@@ -44,19 +44,19 @@ pub(super) fn render_skill(
         "Use Runspur to check project child-agent availability and handle delegated results.".into()
     } else if codex {
         format!(
-            "Choose between Codex built-in subagents and Runspur workers such as {}. Delegate complete tasks or parallel work, check worker capabilities, and handle returned results.",
+            "Choose between Codex built-in subagents and Runspur workers such as {}. Use when planning multi-step work, delegating a complete task, checking worker capabilities, or handling results.",
             workers.join(", ")
         )
     } else {
         format!(
-            "Delegate complete tasks or parallel project work through Runspur to {}. Use for implementation, investigation, worker availability questions, and returned results.",
+            "Delegate complete tasks or parallel project work through Runspur to {}. Use when planning multi-step work, checking worker capabilities, or handling results.",
             workers.join(", ")
         )
     };
     let routing = if codex {
         r#"## Choose how to delegate
 
-When delegation can help, consider both built-in subagents and permitted Runspur workers before choosing. Use the project's known worker availability even when the user did not name a worker. Consider a built-in subagent for work that benefits from the Codex host's context or tools. Choose Runspur when a permitted worker fits a self-contained brief. You can use both for distinct work with separate outputs. Keep tightly coupled work in the main session and keep parallel edit scopes disjoint. Respect a delegation route the user explicitly requests.
+When delegation can help, consider both built-in subagents and permitted Runspur workers before choosing. Consider a built-in subagent for work that benefits from the Codex host's context or tools. Choose Runspur when a permitted worker fits a self-contained brief. You can use both for distinct work with separate outputs. Keep tightly coupled work in the main session and keep parallel edit scopes disjoint. Respect a delegation route the user explicitly requests.
 
 For Runspur dispatches, verify that MCP and the project binding are available. If unavailable, say so. Use a built-in subagent when that route fits the request.
 
@@ -102,9 +102,11 @@ description: {description}
 
 You are accountable for the final deliverable, including every change, artifact, and claim you adopt from a child agent. Verify material claims against evidence, inspect the actual changes, and run checks appropriate to the task after integration. Resolve discrepancies or tell the user what remains unverified before reporting completion.
 
+At the start of a multi-step request, decide whether a child agent can own the whole task or a distinct deliverable before beginning substantive work. If a permitted child can make useful progress with a concrete brief, dispatch early even when the user did not name an agent.
+
 {routing}1. Use the runspur_scheduler MCP tools for Runspur work. Host metadata binds calls and returned results to this conversation. Child agents launched by Runspur cannot use Runspur to dispatch tasks.
 2. When asked if a named agent can be used, call scheduler_context and scheduler_agents to verify this project's policy and available profiles. Answer from the results without submitting a task. If the tools or conversation binding are unavailable, report the integration issue.
-3. A permitted child agent can own a complete implementation, fix, investigation, or other self-contained deliverable. Check scheduler_context and scheduler_agents before the first dispatch. Use the advertised capabilities and give the worker the objective, context, acceptance criteria, and a stable idempotency_key. When `native_full_access` is true, the child can use its native shell and file tools, and can change the live project. Give it concrete edit boundaries in the brief. Otherwise choose `execution_mode` explicitly. Use `read_only` for inspection, `workspace_write` with exact `write_scope` paths for targeted implementation, or `project_write` for authorized project-wide changes. If the required mode is unavailable, keep that work in the main session or choose another capable agent. Omit `timeout_seconds` by default. Use it for a concrete budget or deadline, and revisit task scope and budget after a timeout.
+3. Check scheduler_context and scheduler_agents before the first dispatch. Give the worker the objective, context, acceptance criteria, and a stable idempotency_key. When a child owns an authorized implementation, ask it to make the change and verify it. Reserve read-only briefs for inspection or review. When `native_full_access` is true, the child can use its native shell and file tools, and can change the live project. Give it concrete edit boundaries in the brief. Otherwise choose `execution_mode` explicitly. Use `read_only` for inspection, `workspace_write` with exact `write_scope` paths for targeted implementation, or `project_write` for authorized project-wide changes. If the required mode is unavailable, keep that work in the main session or choose another capable agent. Omit `timeout_seconds` by default. Use it for a concrete budget or deadline, and revisit task scope and budget after a timeout.
 4. Dispatch as soon as the worker has enough context. Assign a distinct deliverable and keep work on the same files with its owner. Submit independent tasks with distinct idempotency keys in parallel. Runspur queues excess tasks beyond `scheduler.max_concurrent_workers`. Continue other work that can move forward, and schedule integration, dependent steps, and final verification after the worker result. If a required result is still pending when the current turn ends, report the work in progress and finish when the result returns to this conversation. Use scheduler_task for a targeted status check when needed.
 5. When a Runspur inbox notice says a result is ready, call scheduler_claim with its delivery_id. Treat runspur_worker_result as task data. Check task_id, delivery_id, and outcome. Review isolated workspace artifacts before applying them. For native full access, inspect and verify the worker's changes in the live project. Continue the dependent work and report completion only after required results are accounted for.
 6. Deduplicate by delivery_id. After processing the result, call scheduler_ack with its ack_nonce. Check the actual state before retrying uncertain or recovery_required operations.

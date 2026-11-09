@@ -171,6 +171,51 @@ impl NativeConnection {
         let _ = self.following(session, owner, false).await;
         received
     }
+
+    async fn deliver_result(
+        &mut self,
+        session: &str,
+        owner: &str,
+        snapshot: &Value,
+        envelope: &DeliveryEnvelope,
+    ) -> Result<DeliveryOutcome> {
+        let status = &snapshot["threadRuntimeStatus"];
+        if status["type"] == "active"
+            && status["activeFlags"].as_array().is_some_and(|flags| {
+                flags
+                    .iter()
+                    .any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")
+            })
+        {
+            return Ok(DeliveryOutcome::Held(
+                "Parent is waiting for approval or user input".into(),
+            ));
+        }
+        // Standalone tool output is queued on an active Codex turn.
+        let request = native_result_request(session, envelope)?;
+        match self
+            .request(
+                "thread-follower-start-turn",
+                json!({"conversationId":session,
+                "turnStart":{"request":request,"context":{"inheritThreadSettings":true}}}),
+                2,
+                Some(owner),
+            )
+            .await
+        {
+            Ok(response) => match response["result"]["result"]["turn"]["id"].as_str() {
+                Some(id) => Ok(DeliveryOutcome::Accepted {
+                    parent_turn_id: id.into(),
+                }),
+                None => Ok(DeliveryOutcome::Uncertain(
+                    "Desktop accepted a response without a correlated turn ID".into(),
+                )),
+            },
+            Err(error) => Ok(DeliveryOutcome::Uncertain(format!(
+                "Result request may have reached the desktop: {error}"
+            ))),
+        }
+    }
 }
 
 impl CodexDesktopAdapter {
@@ -369,45 +414,9 @@ impl CodexDesktopAdapter {
         let snapshot = connection
             .snapshot(&registration.route.session_id, &owner)
             .await?;
-        if snapshot["threadRuntimeStatus"]["type"] == "active" {
-            if snapshot["threadRuntimeStatus"]["activeFlags"]
-                .as_array()
-                .is_some_and(|flags| {
-                    flags
-                        .iter()
-                        .any(|v| v == "waitingOnApproval" || v == "waitingOnUserInput")
-                })
-            {
-                return Ok(DeliveryOutcome::Held(
-                    "Parent is waiting for approval or user input".into(),
-                ));
-            }
-            return Ok(DeliveryOutcome::Busy);
-        }
-        // This is tool-result data, not a new user authorization. No text item omits UI defaults.
-        let request = native_result_request(&registration.route.session_id, envelope)?;
-        match connection
-            .request(
-                "thread-follower-start-turn",
-                json!({"conversationId":registration.route.session_id,
-            "turnStart":{"request":request,"context":{"inheritThreadSettings":true}}}),
-                2,
-                Some(&owner),
-            )
+        connection
+            .deliver_result(&registration.route.session_id, &owner, &snapshot, envelope)
             .await
-        {
-            Ok(response) => match response["result"]["result"]["turn"]["id"].as_str() {
-                Some(id) => Ok(DeliveryOutcome::Accepted {
-                    parent_turn_id: id.into(),
-                }),
-                None => Ok(DeliveryOutcome::Uncertain(
-                    "Desktop accepted a response without a correlated turn ID".into(),
-                )),
-            },
-            Err(error) => Ok(DeliveryOutcome::Uncertain(format!(
-                "Result request may have reached the desktop: {error}"
-            ))),
-        }
     }
 }
 
@@ -575,7 +584,16 @@ mod tests {
         };
         let value = serde_json::to_value(text).unwrap();
         assert_eq!(value["text_elements"], json!([]));
-        let envelope = DeliveryEnvelope {
+        let envelope = test_envelope();
+        let request = native_result_request("origin", &envelope).unwrap();
+        assert_eq!(request["input"], json!([]));
+        assert_eq!(request["toolOutput"]["name"], "runspur_worker_result");
+        assert_eq!(request["toolOutput"]["retain"], true);
+        assert!(!request.to_string().contains("role\":\"user"));
+    }
+
+    fn test_envelope() -> DeliveryEnvelope {
+        DeliveryEnvelope {
             schema_version: 1,
             kind: "task_completed".into(),
             task_id: new_id(),
@@ -591,11 +609,58 @@ mod tests {
                 artifact_refs: vec![],
             },
             ack_nonce: "nonce".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_origin_accepts_result_as_tool_output_and_holds_for_user_decisions() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut connection = NativeConnection {
+            stream: Box::pin(client),
+            server_process: ProcessIdentity {
+                pid: 1,
+                started_at: 1,
+            },
+            client_id: "bridge".into(),
         };
-        let request = native_result_request("origin", &envelope).unwrap();
-        assert_eq!(request["input"], json!([]));
-        assert_eq!(request["toolOutput"]["name"], "runspur_worker_result");
-        assert_eq!(request["toolOutput"]["retain"], true);
-        assert!(!request.to_string().contains("role\":\"user"));
+        let envelope = test_envelope();
+        for flag in ["waitingOnApproval", "waitingOnUserInput"] {
+            let held = connection
+                .deliver_result(
+                    "origin",
+                    "owner",
+                    &json!({
+                        "threadRuntimeStatus": {"type": "active", "activeFlags": [flag]}
+                    }),
+                    &envelope,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(held, DeliveryOutcome::Held(_)));
+        }
+
+        let server = tokio::spawn(async move {
+            let request: Value = read_frame(&mut peer, MAX_NATIVE_FRAME).await.unwrap();
+            assert_eq!(request["method"], "thread-follower-start-turn");
+            assert_eq!(request["targetClientId"], "owner");
+            assert_eq!(request["params"]["conversationId"], "origin");
+            let body = &request["params"]["turnStart"]["request"];
+            assert_eq!(body["input"], json!([]));
+            assert_eq!(body["toolOutput"]["name"], "runspur_worker_result");
+            let reply = json!({"type":"response", "requestId":request["requestId"],
+                "result":{"result":{"turn":{"id":"active-turn"}}}});
+            write_frame(&mut peer, &reply, MAX_NATIVE_FRAME)
+                .await
+                .unwrap();
+        });
+        let active = json!({"threadRuntimeStatus":{"type":"active","activeFlags":[]}});
+        let outcome = connection
+            .deliver_result("origin", "owner", &active, &envelope)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, DeliveryOutcome::Accepted { parent_turn_id } if parent_turn_id == "active-turn")
+        );
+        server.await.unwrap();
     }
 }

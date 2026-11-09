@@ -53,15 +53,28 @@ fn document(bytes: Option<&[u8]>) -> Result<Value> {
     }
 }
 
+fn hook_rule(bridge: Bridge<'_>) -> Value {
+    let mut args = mcp_arguments(bridge.data_dir);
+    args[1] = "${CLAUDE_PROJECT_DIR}".into();
+    args.extend([
+        "--host".into(),
+        "claude-code".into(),
+        ORIGIN_HOOK_FLAG.into(),
+    ]);
+    json!({
+        "matcher": "^mcp__runspur_scheduler__scheduler_.*$",
+        "hooks": [{"type":"command", "command": bridge.program, "args": args, "timeout": 10}]
+    })
+}
+
 async fn prepare_hook(
     root: &Path,
-    program: &str,
-    data_dir: Option<&Path>,
-    enable: bool,
+    previous: Bridge<'_>,
+    desired: Option<Bridge<'_>>,
 ) -> Result<Option<HookEdit>> {
     let path = root.join(HOOK_PATH);
     let before = read_optional_file(&path).await?;
-    if !enable && before.is_none() {
+    if desired.is_none() && before.is_none() {
         return Ok(None);
     }
     let mut settings =
@@ -69,7 +82,7 @@ async fn prepare_hook(
     let root = settings
         .as_object_mut()
         .context("Claude project-local settings must be an object")?;
-    if !enable && !root.contains_key("hooks") {
+    if desired.is_none() && !root.contains_key("hooks") {
         return Ok(None);
     }
     let hooks = root
@@ -77,7 +90,7 @@ async fn prepare_hook(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("Claude hooks must be an object")?;
-    if !enable && !hooks.contains_key("PreToolUse") {
+    if desired.is_none() && !hooks.contains_key("PreToolUse") {
         return Ok(None);
     }
     let rules = hooks
@@ -85,21 +98,19 @@ async fn prepare_hook(
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .context("Claude PreToolUse hooks must be an array")?;
-    let mut args = mcp_arguments(data_dir);
-    args[1] = "${CLAUDE_PROJECT_DIR}".into();
-    args.extend([
-        "--host".into(),
-        "claude-code".into(),
-        ORIGIN_HOOK_FLAG.into(),
-    ]);
-    let rule = json!({
-        "matcher": "^mcp__runspur_scheduler__scheduler_.*$",
-        "hooks": [{"type":"command", "command": program, "args": args, "timeout": 10}]
-    });
+    let previous = hook_rule(previous);
+    let desired = desired.map(hook_rule);
     let mut installed = false;
-    for candidate in rules.iter() {
-        if candidate == &rule {
+    let mut replaced = false;
+    for candidate in rules.iter_mut() {
+        if Some(&*candidate) == desired.as_ref() {
             installed = true;
+        } else if candidate == &previous {
+            installed = true;
+            if let Some(rule) = &desired {
+                candidate.clone_from(rule);
+                replaced = true;
+            }
         } else if candidate
             .get("hooks")
             .and_then(Value::as_array)
@@ -121,20 +132,26 @@ async fn prepare_hook(
             );
         }
     }
-    let content = enable
-        .then(|| serde_json::to_string_pretty(&rule))
+    let content = desired
+        .as_ref()
+        .map(serde_json::to_string_pretty)
         .transpose()?;
-    let after = match (enable, installed) {
-        (true, false) => {
+    let changed = match desired {
+        Some(rule) if !installed => {
             rules.push(rule);
-            Some(format!("{}\n", serde_json::to_string_pretty(&settings)?).into_bytes())
+            true
         }
-        (false, true) => {
-            rules.retain(|candidate| candidate != &rule);
-            Some(format!("{}\n", serde_json::to_string_pretty(&settings)?).into_bytes())
+        Some(_) => replaced,
+        None if installed => {
+            rules.retain(|candidate| candidate != &previous);
+            true
         }
-        (true, true) => before.clone(),
-        (false, false) => return Ok(None),
+        None => return Ok(None),
+    };
+    let after = if changed {
+        Some(format!("{}\n", serde_json::to_string_pretty(&settings)?).into_bytes())
+    } else {
+        before.clone()
     };
     Ok(Some(HookEdit {
         file: ConfigEdit {
@@ -163,6 +180,17 @@ pub(super) async fn prepare(
     } else {
         false
     };
+    prepare_integration(root, config, program, data_dir, profiles, native).await
+}
+
+async fn prepare_integration(
+    root: &Path,
+    config: &ProjectConfig,
+    program: &str,
+    data_dir: Option<&Path>,
+    profiles: &[AgentProfile],
+    native: bool,
+) -> Result<ProjectIntegration> {
     let skill_path = root.join(SKILL_PATH);
     let config_path = root.join(MCP_PATH);
     let skill_old = read_optional_file(&skill_path).await?;
@@ -186,13 +214,14 @@ pub(super) async fn prepare(
         .context("Existing .mcp.json mcpServers must be an object")?;
     let desired = Bridge { program, data_dir };
     let current = servers.get("runspur_scheduler");
-    let bridge = if let Some(current) = current {
-        installed_bridge(current, desired, &config_path).transpose()?.context(
-            "Existing runspur_scheduler MCP entry differs; refusing to overwrite user configuration",
-        )?
-    } else {
-        desired
-    };
+    let installed = current
+        .map(|current| {
+            installed_bridge(current, desired, &config_path).transpose()?.context(
+                "Existing runspur_scheduler MCP entry differs; refusing to overwrite user configuration",
+            )
+        })
+        .transpose()?;
+    let bridge = installed.map_or(desired, |installed| installed.updated(desired));
     let bundled;
     let selected_program = if native && bridge.program == "scheduler-mcp" {
         desired.program
@@ -213,8 +242,12 @@ pub(super) async fn prepare(
     } else {
         selected_program
     };
-    let hook = prepare_hook(root, program, bridge.data_dir, native).await?;
-    let entry = entry(program, bridge.data_dir);
+    let bridge = Bridge {
+        program,
+        data_dir: bridge.data_dir,
+    };
+    let hook = prepare_hook(root, installed.unwrap_or(bridge), native.then_some(bridge)).await?;
+    let entry = entry(bridge.program, bridge.data_dir);
     let changed = if config.integrations.mcp {
         current != Some(&entry)
     } else {
@@ -288,7 +321,7 @@ pub(super) async fn cleanup(
     } else {
         desired
     };
-    let hook = prepare_hook(root, bridge.program, bridge.data_dir, false).await?;
+    let hook = prepare_hook(root, bridge, None).await?;
     if let Some(servers) = servers
         && servers.remove("runspur_scheduler").is_some()
     {
@@ -316,6 +349,143 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn preparation_migrates_the_bridge_and_native_hook_for_the_same_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bundle = root.join("desktop bundle");
+        tokio::fs::create_dir(&bundle).await.unwrap();
+        let suffix = std::env::consts::EXE_SUFFIX;
+        for name in [
+            "runspur-desktop",
+            "schedulerctl",
+            "schedulerd",
+            "scheduler-mcp",
+        ] {
+            tokio::fs::write(bundle.join(format!("{name}{suffix}")), b"fixture")
+                .await
+                .unwrap();
+        }
+        let old = bundle.join(format!("scheduler-mcp{suffix}"));
+        let new = root.join(format!("scheduler-mcp{suffix}"));
+        tokio::fs::write(&new, b"fixture").await.unwrap();
+        let state = root.join("test state");
+        let previous = Bridge {
+            program: old.to_str().unwrap(),
+            data_dir: Some(&state),
+        };
+        let desired = Bridge {
+            program: new.to_str().unwrap(),
+            data_dir: Some(&state),
+        };
+        let old_entry = entry(previous.program, previous.data_dir);
+        let custom = json!({"command":"other"});
+        let original = json!({"mcpServers":{
+            "runspur_scheduler": old_entry,
+            "custom": custom,
+        }});
+        let mcp_path = root.join(MCP_PATH);
+        tokio::fs::write(&mcp_path, serde_json::to_vec(&original).unwrap())
+            .await
+            .unwrap();
+        let custom_hook =
+            json!({"matcher":"Write","hooks":[{"type":"command","command":"local-check"}]});
+        let old_settings = json!({"hooks":{"PreToolUse":[custom_hook, hook_rule(previous)]}});
+        let settings_path = root.join(HOOK_PATH);
+        crate::setup::write_new_file(&settings_path, &serde_json::to_vec(&old_settings).unwrap())
+            .await
+            .unwrap();
+        let config = ProjectConfig {
+            schema_version: scheduler_core::SCHEMA_VERSION,
+            project_id: scheduler_core::new_id(),
+            name: "Test project".into(),
+            main_agent_profile_id: "claude-cli".into(),
+            allowed_worker_profile_ids: ["probe".into()].into(),
+            integrations: Default::default(),
+            limits: Default::default(),
+        };
+
+        let preview = prepare_integration(root, &config, desired.program, Some(&state), &[], true)
+            .await
+            .unwrap();
+
+        let new_mcp = json!({"mcpServers":{
+            "runspur_scheduler": entry(desired.program, desired.data_dir),
+            "custom": custom,
+        }});
+        let new_settings = json!({"hooks":{"PreToolUse":[custom_hook, hook_rule(desired)]}});
+        assert_eq!(
+            document(Some(preview.document.as_bytes())).unwrap(),
+            new_mcp
+        );
+        assert_eq!(
+            document(preview.hook.as_ref().unwrap().file.after.as_deref()).unwrap(),
+            new_settings
+        );
+        assert_eq!(
+            document(read_optional_file(&mcp_path).await.unwrap().as_deref()).unwrap(),
+            original
+        );
+        assert_eq!(
+            document(read_optional_file(&settings_path).await.unwrap().as_deref()).unwrap(),
+            old_settings
+        );
+        preview.install(&config).await.unwrap();
+        assert_eq!(
+            document(read_optional_file(&mcp_path).await.unwrap().as_deref()).unwrap(),
+            new_mcp
+        );
+        assert_eq!(
+            document(read_optional_file(&settings_path).await.unwrap().as_deref()).unwrap(),
+            new_settings
+        );
+
+        let mut legacy_mcp = new_mcp;
+        legacy_mcp["mcpServers"]["runspur_scheduler"]["command"] = json!("scheduler-mcp");
+        tokio::fs::write(&mcp_path, serde_json::to_vec(&legacy_mcp).unwrap())
+            .await
+            .unwrap();
+        let unchanged_hook = serde_json::to_vec(&new_settings).unwrap();
+        tokio::fs::write(&settings_path, &unchanged_hook)
+            .await
+            .unwrap();
+
+        let preview = prepare_integration(root, &config, desired.program, Some(&state), &[], true)
+            .await
+            .unwrap();
+        preview.install(&config).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(settings_path).await.unwrap(),
+            unchanged_hook
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_migration_refuses_to_replace_a_modified_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let previous = Bridge {
+            program: "old-bridge",
+            data_dir: None,
+        };
+        let desired = Bridge {
+            program: "new-bridge",
+            data_dir: None,
+        };
+        let mut rule = hook_rule(previous);
+        rule["hooks"][0]["timeout"] = json!(15);
+        let before = serde_json::to_vec(&json!({"hooks":{"PreToolUse":[rule]}})).unwrap();
+        let path = root.join(HOOK_PATH);
+        crate::setup::write_new_file(&path, &before).await.unwrap();
+
+        let error = prepare_hook(root, previous, Some(desired))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Runspur hook has user changes"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn cleanup_identifies_a_verified_entry_for_another_state() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -327,7 +497,11 @@ mod tests {
         }}))
         .unwrap();
         tokio::fs::write(&path, &before).await.unwrap();
-        let hook = prepare_hook(root, "scheduler-mcp", Some(&installed), true)
+        let bridge = Bridge {
+            program: "scheduler-mcp",
+            data_dir: Some(&installed),
+        };
+        let hook = prepare_hook(root, bridge, Some(bridge))
             .await
             .unwrap()
             .unwrap();
@@ -378,7 +552,11 @@ mod tests {
             .await
             .unwrap();
 
-        let added = prepare_hook(dir.path(), program, None, true)
+        let bridge = Bridge {
+            program,
+            data_dir: None,
+        };
+        let added = prepare_hook(dir.path(), bridge, Some(bridge))
             .await
             .unwrap()
             .unwrap();

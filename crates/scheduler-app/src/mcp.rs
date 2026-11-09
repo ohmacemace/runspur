@@ -323,7 +323,7 @@ impl ServerHandler for ProjectMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("runspur-scheduler", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Runspur child Agents can complete whole assignments, including implementation when their advertised access permits it. Check scheduler_context and scheduler_agents, then dispatch early with scheduler_submit. Keep each deliverable with its assigned Agent. Results return asynchronously to the originating conversation. As the main Agent, you are accountable for the final deliverable. Review and verify child Agent results before adopting them or reporting completion. Child Agents cannot delegate through Runspur.")
+            .with_instructions("At the start of multi-step work, identify whole tasks or distinct deliverables a child Agent can own. Check scheduler_context and scheduler_agents, then dispatch a suitable assignment early with scheduler_submit, even if the user did not name a child Agent. For authorized implementation, ask the child to make and verify the change when its advertised access permits it. Results return asynchronously to the originating conversation. As the main Agent, you are accountable for the final deliverable. Review and verify child Agent results before adopting them or reporting completion. Child Agents cannot delegate through Runspur.")
     }
     async fn list_tools(
         &self,

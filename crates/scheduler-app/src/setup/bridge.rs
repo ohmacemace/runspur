@@ -12,6 +12,17 @@ pub(super) struct Bridge<'a> {
 }
 
 impl<'a> Bridge<'a> {
+    pub fn updated(self, desired: Bridge<'a>) -> Self {
+        if Path::new(self.program).is_absolute() && Path::new(desired.program).is_absolute() {
+            Self {
+                program: desired.program,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
     pub fn recognize(
         program: &'a str,
         args: &[&'a str],
@@ -79,6 +90,10 @@ fn packaged_bridge(program: &str) -> bool {
     if !path.is_absolute() {
         return false;
     }
+    #[cfg(windows)]
+    if default_install_bridge(path) {
+        return true;
+    }
     let Ok(path) = fs::canonicalize(path) else {
         return false;
     };
@@ -99,6 +114,34 @@ fn packaged_bridge(program: &str) -> bool {
             && bundle.join(format!("schedulerd{suffix}")).is_file()
             && (bundle.join(format!("runspur-desktop{suffix}")).is_file()
                 || bundle.join(".runspur-install.json").is_file()))
+}
+
+#[cfg(windows)]
+fn default_install_bridge(path: &Path) -> bool {
+    // An uninstall can remove the siblings that identify an installed package.
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let path = path.replace('/', "\\");
+    [
+        ("LOCALAPPDATA", r"Runspur Desktop\scheduler-mcp.exe"),
+        (
+            "LOCALAPPDATA",
+            r"Programs\Runspur Desktop\scheduler-mcp.exe",
+        ),
+        ("ProgramFiles", r"Runspur Desktop\scheduler-mcp.exe"),
+        (
+            "APPDATA",
+            r"npm\node_modules\runspur\native\scheduler-mcp.exe",
+        ),
+    ]
+    .into_iter()
+    .any(|(variable, relative)| {
+        std::env::var_os(variable)
+            .map(|root| Path::new(&root).join(relative))
+            .is_some_and(|installed| installed.as_os_str().eq_ignore_ascii_case(&path))
+    })
 }
 
 fn npm_bundle(bundle: &Path, control: &str) -> bool {

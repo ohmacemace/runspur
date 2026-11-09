@@ -25,6 +25,34 @@ struct Health {
     protocol_version: u32,
 }
 
+#[derive(Clone, Copy)]
+enum ProbeVersion {
+    CurrentRelease,
+    CompatibleProtocol,
+}
+
+impl Health {
+    fn validate(&self, version: ProbeVersion) -> Result<()> {
+        if self.protocol_version != WIRE_VERSION {
+            bail!(
+                "The running scheduler uses protocol {}. This Runspur CLI requires protocol {}.",
+                self.protocol_version,
+                WIRE_VERSION,
+            );
+        }
+        if matches!(version, ProbeVersion::CurrentRelease)
+            && self.version != env!("CARGO_PKG_VERSION")
+        {
+            bail!(
+                "The running scheduler is version {}. This Runspur CLI requires version {}. When active tasks have finished, run `runspur stop` and retry.",
+                self.version,
+                env!("CARGO_PKG_VERSION"),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Use the compatible scheduler for this state directory, starting it in the background if absent.
 pub async fn connect(root: &Path) -> Result<LocalClient> {
     connect_with(root, None).await
@@ -35,12 +63,14 @@ pub async fn connect_bundled(root: &Path, program: &Path) -> Result<LocalClient>
 }
 
 pub async fn health(root: &Path) -> Result<Option<serde_json::Value>> {
-    Ok(probe(root).await?.map(|(_, health)| health))
+    Ok(probe(root, ProbeVersion::CurrentRelease)
+        .await?
+        .map(|(_, health)| health))
 }
 
 async fn connect_with(root: &Path, program: Option<&Path>) -> Result<LocalClient> {
     let root = std::path::absolute(root)?;
-    if let Some((client, _)) = probe(&root).await? {
+    if let Some((client, _)) = probe(&root, ProbeVersion::CurrentRelease).await? {
         return Ok(client);
     }
     start_background(&root, program).await
@@ -66,7 +96,7 @@ async fn start_background(root: &Path, bundled: Option<&Path>) -> Result<LocalCl
         .context("Cannot start the Runspur scheduler in the background")?;
     let ready = tokio::time::timeout(START_TIMEOUT, async {
         loop {
-            if let Some((client, _)) = probe(root).await? {
+            if let Some((client, _)) = probe(root, ProbeVersion::CurrentRelease).await? {
                 return Ok(client);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -87,7 +117,7 @@ async fn start_background(root: &Path, bundled: Option<&Path>) -> Result<LocalCl
 
 /// Stop the scheduler for this directory and wait until its executable and pipe are released.
 pub async fn stop(root: &Path) -> Result<()> {
-    let Some((client, _)) = probe(root).await? else {
+    let Some((client, _)) = probe(root, ProbeVersion::CompatibleProtocol).await? else {
         return Ok(());
     };
     tokio::time::timeout(STOP_TIMEOUT, async {
@@ -107,7 +137,10 @@ pub async fn stop(root: &Path) -> Result<()> {
     .context("Runspur scheduler did not stop within 30 seconds")?
 }
 
-async fn probe(root: &Path) -> Result<Option<(LocalClient, serde_json::Value)>> {
+async fn probe(
+    root: &Path,
+    version: ProbeVersion,
+) -> Result<Option<(LocalClient, serde_json::Value)>> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -141,15 +174,7 @@ async fn probe(root: &Path) -> Result<Option<(LocalClient, serde_json::Value)>> 
         Err(error) => return Err(error),
     };
     let health = Health::deserialize(&value).context("Invalid scheduler health data")?;
-    if health.protocol_version != WIRE_VERSION || health.version != env!("CARGO_PKG_VERSION") {
-        bail!(
-            "The running scheduler is version {} (protocol {}). This Runspur CLI requires version {} (protocol {}).",
-            health.version,
-            health.protocol_version,
-            env!("CARGO_PKG_VERSION"),
-            WIRE_VERSION,
-        );
-    }
+    health.validate(version)?;
     Ok(Some((client, value)))
 }
 
@@ -211,4 +236,21 @@ pub async fn run(data_dir: Option<PathBuf>, max_workers: usize) -> Result<()> {
     // Keep the first pipe instance until the scheduler finishes draining its work.
     scheduler.shutdown().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_accepts_an_older_release_with_the_same_protocol() {
+        let mut health = Health {
+            version: "0.1.2".into(),
+            protocol_version: WIRE_VERSION,
+        };
+        assert!(health.validate(ProbeVersion::CompatibleProtocol).is_ok());
+        assert!(health.validate(ProbeVersion::CurrentRelease).is_err());
+        health.protocol_version += 1;
+        assert!(health.validate(ProbeVersion::CompatibleProtocol).is_err());
+    }
 }

@@ -1195,6 +1195,54 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn codex_refreshes_an_old_desktop_bridge_on_the_same_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = config();
+        let old = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Runspur Desktop/scheduler-mcp.exe");
+        let new = root.join("native/scheduler-mcp.exe");
+        let state = root.join("state");
+        let old = old.to_str().unwrap();
+        let new = new.to_str().unwrap();
+        let path = root.join(MCP_PATH);
+        write_new_file(
+            &path,
+            b"# keep comment\n[mcp_servers.other]\ncommand = 'other'\n",
+        )
+        .await
+        .unwrap();
+        install_project(root, &config, old, Some(&state), &[])
+            .await
+            .unwrap();
+        let original = tokio::fs::read_to_string(&path).await.unwrap();
+
+        let conflict = codex::prepare(root, &config, new, Some(root), &[])
+            .await
+            .err()
+            .unwrap();
+        assert!(conflict.to_string().starts_with("[runspur_state_conflict]"));
+
+        let preview = codex::prepare(root, &config, new, Some(&state), &[])
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
+        preview.install(&config).await.unwrap();
+        let updated = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(updated.starts_with("# keep comment"));
+        let document = updated.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+        assert_eq!(
+            document["mcp_servers"]["runspur_scheduler"]["command"].as_str(),
+            Some(new)
+        );
+    }
+
     #[test]
     fn profile_seeding_repairs_a_missing_reserved_worker_executable() {
         let dir = tempfile::tempdir().unwrap();
@@ -1290,11 +1338,15 @@ mod tests {
         let generated = tokio::fs::read_to_string(&skill).await.unwrap();
         assert!(description(&generated).contains("Claude Code (CC)"));
         assert!(description(&generated).contains("built-in subagents"));
+        assert!(description(&generated).contains("planning multi-step work"));
         assert!(!description(&generated).contains("Probe"));
         assert!(
             generated.contains("consider both built-in subagents and permitted Runspur workers")
         );
         assert!(generated.contains("use both for distinct work"));
+        assert!(generated.contains("before beginning substantive work"));
+        assert!(generated.contains("even when the user did not name an agent"));
+        assert!(generated.contains("ask it to make the change and verify it"));
         assert!(generated.contains("You are accountable for the final deliverable"));
         assert!(generated.contains("Verify material claims"));
         assert!(generated.contains("Omit `timeout_seconds` by default"));
