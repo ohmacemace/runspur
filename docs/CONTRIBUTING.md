@@ -2,6 +2,8 @@
 
 **English** · [简体中文](#参与贡献)
 
+[Code of conduct](CODE_OF_CONDUCT.md) · [Report a security vulnerability](SECURITY.md)
+
 ## Report an issue
 
 Search for an existing report first. For a bug, include the Runspur, Windows, and Agent versions, the smallest set of steps that reproduces it, and the expected and actual behavior. Remove credentials and private project content from logs before sharing them. [Issues](https://github.com/ohmacemace/runspur/issues)
@@ -36,6 +38,8 @@ The development app uses separate local scheduler data. Verify CLI and Windows a
 ## 参与贡献
 
 [English](#contributing-to-runspur) · **简体中文**
+
+[行为准则](CODE_OF_CONDUCT.md#行为准则) · [报告安全漏洞](SECURITY.md#安全政策)
 
 ### 报告问题
 
