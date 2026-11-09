@@ -169,6 +169,42 @@ pub fn authorize_origin(
     Ok(())
 }
 
+pub fn valid_scoped_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && path.split('/').all(|part| {
+            if part.is_empty()
+                || part.ends_with([' ', '.'])
+                || part.eq_ignore_ascii_case(".git")
+                || part
+                    .chars()
+                    .any(|c| c.is_control() || "\\:*?\"<>|~".contains(c))
+            {
+                return false;
+            }
+            let device = part
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .trim_end()
+                .to_ascii_uppercase();
+            if matches!(
+                device.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            ) {
+                return false;
+            }
+            !["COM", "LPT"].into_iter().any(|prefix| {
+                device.strip_prefix(prefix).is_some_and(|suffix| {
+                    matches!(
+                        suffix,
+                        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+            })
+        })
+}
+
 pub fn validate_submission(config: &ProjectConfig, submission: &SubmitTask) -> Result<u32> {
     validate_project(config)?;
     if !config
@@ -190,6 +226,45 @@ pub fn validate_submission(config: &ProjectConfig, submission: &SubmitTask) -> R
         return Err(SchedulerError::new(
             "invalid_idempotency_key",
             "A bounded idempotency_key is required",
+        ));
+    }
+    let mode = submission.execution_mode;
+    if !config.limits.permits_execution(mode) {
+        let (code, message) = if mode == crate::ExecutionMode::ProjectWrite {
+            (
+                "project_write_disabled",
+                "Project policy has not enabled project-wide writes",
+            )
+        } else {
+            (
+                "workspace_write_disabled",
+                "Project policy has not enabled scoped writes",
+            )
+        };
+        return Err(SchedulerError::new(code, message));
+    }
+    if mode == crate::ExecutionMode::WorkspaceWrite {
+        let unique_paths: std::collections::BTreeSet<_> = submission
+            .write_scope
+            .iter()
+            .map(|path| path.to_lowercase())
+            .collect();
+        if !(1..=64).contains(&submission.write_scope.len())
+            || unique_paths.len() != submission.write_scope.len()
+            || !submission
+                .write_scope
+                .iter()
+                .all(|path| valid_scoped_path(path))
+        {
+            return Err(SchedulerError::new(
+                "invalid_write_scope",
+                "Provide 1 to 64 distinct exact project-relative file paths",
+            ));
+        }
+    } else if !submission.write_scope.is_empty() {
+        return Err(SchedulerError::new(
+            "invalid_write_scope",
+            "Only workspace_write accepts a list of exact writable files",
         ));
     }
     let timeout = submission
@@ -253,6 +328,65 @@ impl AuthContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_write_requires_its_own_opt_in() {
+        let mut project = project();
+        project.limits.allow_workspace_write = true;
+        let mut submission = SubmitTask {
+            worker_profile_id: "claude-worker".into(),
+            prompt: "Change the project files".into(),
+            idempotency_key: "project-write".into(),
+            timeout_seconds: None,
+            execution_mode: crate::ExecutionMode::ProjectWrite,
+            write_scope: vec![],
+        };
+        assert_eq!(
+            validate_submission(&project, &submission).unwrap_err().code,
+            "project_write_disabled"
+        );
+        project.limits.allow_project_write = true;
+        assert!(validate_submission(&project, &submission).is_ok());
+        submission.write_scope = vec!["src/main.rs".into()];
+        assert_eq!(
+            validate_submission(&project, &submission).unwrap_err().code,
+            "invalid_write_scope"
+        );
+    }
+
+    #[test]
+    fn workspace_write_requires_opt_in_and_exact_portable_paths() {
+        let mut project = project();
+        let mut submission = SubmitTask {
+            worker_profile_id: "claude-worker".into(),
+            prompt: "Create the file".into(),
+            idempotency_key: "write".into(),
+            timeout_seconds: None,
+            execution_mode: crate::ExecutionMode::WorkspaceWrite,
+            write_scope: vec!["src/hello.py".into()],
+        };
+        assert_eq!(
+            validate_submission(&project, &submission).unwrap_err().code,
+            "workspace_write_disabled"
+        );
+        project.limits.allow_workspace_write = true;
+        assert!(validate_submission(&project, &submission).is_ok());
+        for invalid in [
+            "../hello.py",
+            "C:/escape",
+            "file:stream",
+            ".git/config",
+            "NUL.txt",
+            "a\\b",
+            "x.",
+        ] {
+            submission.write_scope = vec![invalid.into()];
+            assert_eq!(
+                validate_submission(&project, &submission).unwrap_err().code,
+                "invalid_write_scope"
+            );
+        }
+    }
     use crate::{IntegrationConfig, new_id};
 
     fn project() -> ProjectConfig {
@@ -287,6 +421,8 @@ mod tests {
             prompt: "read".into(),
             idempotency_key: "key".into(),
             timeout_seconds: None,
+            execution_mode: crate::ExecutionMode::ReadOnly,
+            write_scope: Vec::new(),
         };
         assert_eq!(
             validate_submission(&p, &s).unwrap_err().code,

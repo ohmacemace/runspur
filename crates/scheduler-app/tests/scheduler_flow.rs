@@ -12,13 +12,208 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use scheduler_core::*;
 use scheduler_platform::{DataPaths, LocalClient, LocalListener};
-use scheduler_runtime::{DeliveryOutcome, ParentAdapter, ResolvedParent, Scheduler, serve};
+use scheduler_runtime::{
+    DeliveryOutcome, ParentAdapter, ResolvedParent, Scheduler, WorkerAdapter, WorkerContext, serve,
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout},
     sync::mpsc,
 };
+use tokio_util::sync::CancellationToken;
+
+struct SimulatedAgent {
+    id: &'static str,
+    kind: AgentKind,
+    completions: mpsc::UnboundedSender<DeliveryEnvelope>,
+}
+
+#[async_trait]
+impl ParentAdapter for SimulatedAgent {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn profile_kind(&self) -> AgentKind {
+        self.kind.clone()
+    }
+    fn family(&self) -> &'static str {
+        self.id
+    }
+    async fn resolve(
+        &self,
+        project: &ProjectRecord,
+        origin: &OriginSession,
+    ) -> Result<ResolvedParent> {
+        Ok(ResolvedParent {
+            route: ParentRoute {
+                adapter_id: self.id.into(),
+                session_id: origin.provider_session_id.clone(),
+                parameters: json!({"private_route":"fixture"}),
+            },
+            generation: format!("{}-owner", self.id),
+            workspace_root: project.root.clone(),
+        })
+    }
+    async fn deliver(
+        &self,
+        _registration: &Registration,
+        envelope: &DeliveryEnvelope,
+    ) -> DeliveryOutcome {
+        self.completions.send(envelope.clone()).unwrap();
+        DeliveryOutcome::AcceptedWithoutReference
+    }
+}
+
+#[async_trait]
+impl WorkerAdapter for SimulatedAgent {
+    fn profile_kind(&self) -> AgentKind {
+        self.kind.clone()
+    }
+    fn family(&self) -> &'static str {
+        self.id
+    }
+    async fn run(
+        &self,
+        task: &QueuedTask,
+        _context: WorkerContext<'_>,
+        _cancel: CancellationToken,
+    ) -> Result<Completion> {
+        Ok(Completion {
+            schema_version: SCHEMA_VERSION,
+            task_id: task.view.task_id.clone(),
+            attempt_id: task.attempt_id.clone(),
+            execution_state: ExecutionState::Succeeded,
+            finished_at_ms: now_ms(),
+            result: TaskResult {
+                summary: format!("{} executed {}", self.id, task.prompt),
+                exit_code: None,
+                error_class: None,
+                verification: vec![],
+                artifact_refs: vec![],
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn adapters_swap_roles_and_same_host_session_id_stays_isolated() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = DataPaths::prepare(&directory.path().join("state")).unwrap();
+    let root = directory.path().join("project");
+    tokio::fs::create_dir(&root).await.unwrap();
+    let (alpha_results, mut alpha) = mpsc::unbounded_channel();
+    let (beta_results, mut beta) = mpsc::unbounded_channel();
+    let alpha_adapter = Arc::new(SimulatedAgent {
+        id: "alpha",
+        kind: AgentKind::CodexExec,
+        completions: alpha_results,
+    });
+    let beta_adapter = Arc::new(SimulatedAgent {
+        id: "beta",
+        kind: AgentKind::ClaudePrint,
+        completions: beta_results,
+    });
+    let app = Scheduler::with_adapters(
+        paths,
+        2,
+        vec![alpha_adapter.clone(), beta_adapter.clone()],
+        vec![alpha_adapter, beta_adapter],
+    )
+    .unwrap();
+    for (id, kind) in [
+        ("alpha", AgentKind::CodexExec),
+        ("beta", AgentKind::ClaudePrint),
+    ] {
+        app.store
+            .put_profile(AgentProfile {
+                profile_id: id.into(),
+                kind,
+                program: Some("unused-by-simulated-adapter.exe".into()),
+                model: None,
+                reasoning_effort: None,
+                environment_keys: Default::default(),
+            })
+            .await
+            .unwrap();
+    }
+    let mut project = ProjectRecord {
+        root,
+        revision: String::new(),
+        config: ProjectConfig {
+            schema_version: SCHEMA_VERSION,
+            project_id: new_id(),
+            name: "swappable".into(),
+            main_agent_profile_id: "alpha".into(),
+            allowed_worker_profile_ids: ["beta".into()].into(),
+            integrations: IntegrationConfig::default(),
+            limits: DispatchLimits::default(),
+        },
+    };
+    let host_session = OriginSession {
+        provider_session_id: "same-id-in-both-hosts".into(),
+        source: OriginSource::RequestMetadata,
+    };
+    let loops = app.start();
+    let mut submissions = Vec::new();
+    for (main, worker) in [("alpha", "beta"), ("beta", "alpha")] {
+        project.config.main_agent_profile_id = main.into();
+        project.config.allowed_worker_profile_ids = [worker.into()].into();
+        app.handle(&AuthContext::Admin, Operation::PutProject(project.clone()))
+            .await
+            .unwrap();
+        let auth = app
+            .resolve_origin(&project.config.project_id, Some(&host_session))
+            .await
+            .unwrap();
+        let context = app.handle(&auth, Operation::SessionStatus).await.unwrap();
+        assert_eq!(context["origin"]["origin_id"], auth.root().unwrap().1);
+        assert!(context["origin"]["route"].get("parameters").is_none());
+        let task: TaskAccepted = serde_json::from_value(
+            app.handle(
+                &auth,
+                Operation::Submit(SubmitTask {
+                    worker_profile_id: worker.into(),
+                    prompt: format!("for {main}"),
+                    idempotency_key: "same-key".into(),
+                    timeout_seconds: Some(15),
+                    execution_mode: ExecutionMode::ReadOnly,
+                    write_scope: vec![],
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let result = event(if main == "alpha" {
+            &mut alpha
+        } else {
+            &mut beta
+        })
+        .await;
+        assert_eq!(result.task_id, task.task_id);
+        assert_eq!(
+            result.result.summary,
+            format!("{worker} executed for {main}")
+        );
+        let acknowledgement = Operation::Ack {
+            delivery_id: result.delivery_id,
+            nonce: result.ack_nonce,
+        };
+        app.handle(&auth, acknowledgement.clone()).await.unwrap();
+        wait_delivery(&app, &task.task_id, DeliveryState::AcknowledgedByParent).await;
+        submissions.push((auth, task.task_id, acknowledgement));
+    }
+    for (index, (_, task_id, acknowledgement)) in submissions.iter().enumerate() {
+        let (other, _, _) = &submissions[1 - index];
+        assert!(app.store.task(other, task_id).await.is_err());
+        assert!(app.handle(other, acknowledgement.clone()).await.is_err());
+    }
+    app.shutdown().await;
+    for task in loops {
+        task.await.unwrap();
+    }
+}
 
 #[derive(Clone)]
 struct Origin {
@@ -59,6 +254,12 @@ impl FixtureParent {
 impl ParentAdapter for FixtureParent {
     fn id(&self) -> &'static str {
         "codex-desktop"
+    }
+    fn profile_kind(&self) -> AgentKind {
+        AgentKind::CodexDesktop
+    }
+    fn family(&self) -> &'static str {
+        "codex"
     }
     async fn resolve(
         &self,
@@ -236,6 +437,8 @@ fn submission(key: &str, prompt: Value) -> Operation {
         prompt: prompt.to_string(),
         idempotency_key: key.into(),
         timeout_seconds: Some(15),
+        execution_mode: ExecutionMode::ReadOnly,
+        write_scope: vec![],
     })
 }
 async fn event(receiver: &mut mpsc::UnboundedReceiver<DeliveryEnvelope>) -> DeliveryEnvelope {
@@ -262,6 +465,172 @@ async fn wait_delivery(app: &Scheduler, task_id: &str, expected: DeliveryState) 
     })
     .await
     .unwrap();
+}
+
+async fn query(harness: &Harness, arguments: &[&str]) -> Value {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_schedulerctl"));
+    command
+        .arg("--data-dir")
+        .arg(&harness.app.paths.root)
+        .args(arguments)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "schedulerctl {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn cli_queries_project_sessions_and_dispatch_details() {
+    let harness = Harness::new().await;
+    let project = harness.project("primary project").await;
+    let other = harness.project("other project").await;
+    let (session, mut results, _) = harness.parent.add(&project);
+    let (second_session, _second_results, _) = harness.parent.add(&project);
+    let (other_session, _other_results, _) = harness.parent.add(&other);
+    let origin = harness.root(&project, &session);
+    let project_id = &project.config.project_id;
+
+    // Leading JSON whitespace makes the detail span several IPC chunks while
+    // leaving the probe's result small.
+    let prompt = format!(
+        "{}{}",
+        "\t".repeat(220_000),
+        json!({"summary":"子 Agent result 🚀","delay_ms":1})
+    );
+    let first: TaskAccepted = serde_json::from_value(
+        origin
+            .call(Operation::Submit(SubmitTask {
+                worker_profile_id: "probe".into(),
+                prompt: prompt.clone(),
+                idempotency_key: "first".into(),
+                timeout_seconds: Some(15),
+                execution_mode: ExecutionMode::ReadOnly,
+                write_scope: vec![],
+            }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let delivery = event(&mut results).await;
+    assert_eq!(delivery.task_id, first.task_id);
+    wait_delivery(
+        &harness.app,
+        &first.task_id,
+        DeliveryState::AcceptedByTransport,
+    )
+    .await;
+
+    let detail = query(&harness, &["task", &first.task_id]).await;
+    assert_eq!(detail["session_id"], session);
+    assert!(
+        detail["prompt"].as_str() == Some(prompt.as_str()),
+        "large task prompt did not round-trip"
+    );
+    assert_eq!(detail["task"]["worker_profile_id"], "probe");
+    assert_eq!(detail["task"]["execution_state"], "succeeded");
+    assert_eq!(detail["task"]["result"]["summary"], "子 Agent result 🚀");
+    assert_eq!(detail["task"]["delivery_state"], "accepted_by_transport");
+
+    origin
+        .call(Operation::Ack {
+            delivery_id: delivery.delivery_id,
+            nonce: delivery.ack_nonce,
+        })
+        .await
+        .unwrap();
+    let detail = query(&harness, &["task", &first.task_id]).await;
+    assert_eq!(detail["task"]["delivery_state"], "acknowledged_by_parent");
+
+    harness
+        .root(&project, &second_session)
+        .call(submission("independent", json!({"delay_ms":1})))
+        .await
+        .unwrap();
+    harness
+        .root(&other, &other_session)
+        .call(submission("outside", json!({"delay_ms":1})))
+        .await
+        .unwrap();
+    let latest = origin
+        .call(submission("latest", json!({"delay_ms":1})))
+        .await
+        .unwrap();
+
+    let sessions = query(
+        &harness,
+        &["sessions", "--project", project_id, "--limit", "1"],
+    )
+    .await;
+    assert_eq!(sessions["items"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions["items"][0]["session_id"], session);
+    assert_eq!(sessions["items"][0]["task_count"], 2);
+    let cursor = sessions["next_cursor"].as_i64().unwrap().to_string();
+    let sessions = query(
+        &harness,
+        &["sessions", "--project", project_id, "--before", &cursor],
+    )
+    .await;
+    assert_eq!(sessions["items"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions["items"][0]["session_id"], second_session);
+    assert_eq!(sessions["items"][0]["task_count"], 1);
+    assert!(sessions["next_cursor"].is_null());
+
+    let mut filters = vec![
+        "tasks",
+        "--project",
+        project_id,
+        "--session",
+        &session,
+        "--limit",
+        "1",
+    ];
+    let tasks = query(&harness, &filters).await;
+    assert_eq!(tasks["items"].as_array().unwrap().len(), 1);
+    assert_eq!(tasks["items"][0]["task_id"], latest["task_id"]);
+    assert_eq!(tasks["items"][0]["worker_profile_id"], "probe");
+    let cursor = tasks["next_cursor"].as_i64().unwrap().to_string();
+    filters.extend(["--before", &cursor]);
+    let tasks = query(&harness, &filters).await;
+    assert_eq!(tasks["items"].as_array().unwrap().len(), 1);
+    assert_eq!(tasks["items"][0]["task_id"], first.task_id);
+    assert_eq!(
+        tasks["items"][0]["delivery_state"],
+        "acknowledged_by_parent"
+    );
+    assert!(tasks["next_cursor"].is_null());
+
+    for operation in [
+        Operation::ListSessions {
+            project_id: project_id.clone(),
+            before: None,
+            limit: 1,
+        },
+        Operation::TaskHistory {
+            project_id: Some(project_id.clone()),
+            session_id: Some(session.clone()),
+            before: None,
+            limit: 1,
+        },
+        Operation::TaskDetail {
+            task_id: first.task_id,
+            offset: 0,
+            revision: None,
+        },
+    ] {
+        let error = origin.call(operation).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SchedulerError>().unwrap().code,
+            "permission_denied"
+        );
+    }
+    harness.shutdown().await;
 }
 
 #[tokio::test]
@@ -414,7 +783,7 @@ struct McpChild {
     next_id: u64,
 }
 impl McpChild {
-    async fn start(project: &ProjectRecord, data: &Path) -> Self {
+    async fn start(project: &ProjectRecord, data: &Path, stale_session: &str) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_scheduler-mcp"))
             .args([
                 "--project-root",
@@ -422,7 +791,7 @@ impl McpChild {
                 "--data-dir",
                 data.to_str().unwrap(),
             ])
-            .env_remove("CODEX_THREAD_ID")
+            .env("CODEX_THREAD_ID", stale_session)
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -504,7 +873,7 @@ async fn actual_mcp_stdio_process_uses_per_call_metadata_for_two_roots() {
     let project = harness.project("MCP 项目").await;
     let (a, mut a_results, _) = harness.parent.add(&project);
     let (b, mut b_results, _) = harness.parent.add(&project);
-    let mut mcp = McpChild::start(&project, &harness.app.paths.root).await;
+    let mut mcp = McpChild::start(&project, &harness.app.paths.root, &a).await;
     let listing = mcp.request("tools/list", json!({})).await;
     assert!(
         listing["result"]["tools"]
@@ -608,6 +977,8 @@ async fn crash_between_completion_file_and_database_commit_is_recovered_without_
                 prompt: "never run again".into(),
                 idempotency_key: "crash-boundary".into(),
                 timeout_seconds: None,
+                execution_mode: ExecutionMode::ReadOnly,
+                write_scope: vec![],
             },
         )
         .await

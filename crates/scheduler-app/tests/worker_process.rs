@@ -74,6 +74,8 @@ async fn fixture(
                 prompt: prompt.to_string(),
                 idempotency_key: new_id(),
                 timeout_seconds: Some(timeout),
+                execution_mode: ExecutionMode::ReadOnly,
+                write_scope: vec![],
             },
         )
         .await

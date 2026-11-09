@@ -6,7 +6,19 @@ use scheduler_platform::{LocalListener, PeerConnection, proof_payload, read_fram
 
 use crate::Scheduler;
 
+enum ConnectionAuth {
+    Scheduler(AuthContext, Option<String>),
+    ClaudeHook {
+        project_id: String,
+        origin: OriginSession,
+    },
+}
+
 pub async fn serve(scheduler: Arc<Scheduler>, mut listener: LocalListener) -> Result<()> {
+    serve_on(scheduler, &mut listener).await
+}
+
+pub async fn serve_on(scheduler: Arc<Scheduler>, listener: &mut LocalListener) -> Result<()> {
     let mut connections = tokio::task::JoinSet::new();
     let limit = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
@@ -75,12 +87,31 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
             bail!("Client authentication proof failed");
         }
         let auth = match &proof.credential {
-            CredentialRef::Admin => AuthContext::Admin,
-            CredentialRef::Project { project_id } => {
-                scheduler
-                    .resolve_origin(project_id, proof.origin.as_ref())
-                    .await?
-            }
+            CredentialRef::Admin => ConnectionAuth::Scheduler(AuthContext::Admin, None),
+            CredentialRef::Project { project_id } => match proof.origin.as_ref() {
+                Some(origin) if origin.source == OriginSource::SessionHook => {
+                    ConnectionAuth::ClaudeHook {
+                        project_id: project_id.clone(),
+                        origin: origin.clone(),
+                    }
+                }
+                Some(origin) if origin.source == OriginSource::ClaudeTool => {
+                    let (auth, operation_hash) = scheduler
+                        .resolve_claude_call(project_id, origin, &peer.process)
+                        .await?;
+                    ConnectionAuth::Scheduler(auth, Some(operation_hash))
+                }
+                _ => ConnectionAuth::Scheduler(
+                    scheduler
+                        .resolve_origin_with_peer(
+                            project_id,
+                            proof.origin.as_ref(),
+                            Some(&peer.process),
+                        )
+                        .await?,
+                    None,
+                ),
+            },
         };
         Ok::<_, anyhow::Error>((auth, key.sign("server", &payload)))
     }
@@ -111,6 +142,7 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
     )
     .await?;
     let request: ApiRequest = read_frame(&mut peer.stream, MAX_FRAME_BYTES).await?;
+    let shutdown = matches!(request.operation, Operation::Shutdown);
     let response = if request.version != WIRE_VERSION {
         ApiResponse::error(
             request.request_id,
@@ -118,7 +150,34 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
             "Unsupported local API version",
         )
     } else {
-        match scheduler.handle(&auth, request.operation).await {
+        let result = match auth {
+            ConnectionAuth::Scheduler(auth, expected) => {
+                if expected.as_ref().is_some_and(|expected| {
+                    fingerprint(&request.operation).as_ref() != Ok(expected)
+                }) {
+                    Err(SchedulerError::new(
+                        "invalid_claude_call_proof",
+                        "Claude Code tool input changed after its native hook attestation",
+                    )
+                    .into())
+                } else {
+                    scheduler.handle(&auth, request.operation).await
+                }
+            }
+            ConnectionAuth::ClaudeHook { project_id, origin } => match request.operation {
+                Operation::RegisterClaudeHook(hook) => {
+                    scheduler
+                        .register_claude_hook(&project_id, &origin, hook, &peer.process)
+                        .await
+                }
+                _ => Err(SchedulerError::new(
+                    "invalid_claude_hook_request",
+                    "Claude Code hook connections can only attest native calls",
+                )
+                .into()),
+            },
+        };
+        match result {
             Ok(value) => ApiResponse::success(request.request_id, value),
             Err(error) => {
                 let api = api_error(&error);
@@ -127,6 +186,9 @@ pub async fn serve_connection(scheduler: Arc<Scheduler>, mut peer: PeerConnectio
         }
     };
     write_frame(&mut peer.stream, &response, MAX_FRAME_BYTES).await?;
+    if shutdown && response.error.is_none() {
+        scheduler.request_shutdown();
+    }
     Ok(())
 }
 

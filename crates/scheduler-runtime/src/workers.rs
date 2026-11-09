@@ -19,8 +19,22 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "scoped_files.rs"]
+pub mod scoped_files;
+
 const MAX_LINE: usize = 1024 * 1024;
 const MAX_LOG: usize = 8 * 1024 * 1024;
+const SCOPED_CLAUDE_VERSIONS: &[&str] = &["2.1.220", "2.1.319"];
+const SCOPED_CLAUDE_AUTH_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "API_TIMEOUT_MS",
+];
 
 pub fn redact_text(text: &str) -> String {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -147,7 +161,7 @@ impl ParsedWorker {
     }
 }
 
-fn resolve_program(program: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_program(program: &Path) -> Result<PathBuf> {
     let resolved = if program.is_absolute() {
         fs_canonical(program)?
     } else if program.components().count() == 1 {
@@ -193,7 +207,7 @@ fn fs_canonical(path: &Path) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(path)?)
 }
 
-pub fn worker_command(task: &QueuedTask) -> Result<Command> {
+fn worker_command(task: &QueuedTask, attempt_dir: &Path) -> Result<Command> {
     validate_profile(&task.profile)?;
     let program = resolve_program(
         task.profile
@@ -202,8 +216,14 @@ pub fn worker_command(task: &QueuedTask) -> Result<Command> {
             .context("Worker has no executable")?,
     )?;
     let mut command = Command::new(program);
+    let scoped = !task.execution_mode.is_read_only();
+    let cwd = if scoped {
+        scoped_files::ScopedWorkspace::workspace(attempt_dir)
+    } else {
+        task.project_root.clone()
+    };
     command
-        .current_dir(&task.project_root)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -236,7 +256,9 @@ pub fn worker_command(task: &QueuedTask) -> Result<Command> {
     .into();
     for (key, value) in std::env::vars_os() {
         let name = key.to_string_lossy().to_ascii_uppercase();
-        if defaults.contains(name.as_str()) || task.profile.environment_keys.contains(name.as_str())
+        if defaults.contains(name.as_str())
+            || (task.profile.environment_keys.contains(name.as_str())
+                && (!scoped || SCOPED_CLAUDE_AUTH_KEYS.contains(&name.as_str())))
         {
             command.env(key, value);
         }
@@ -261,7 +283,8 @@ pub fn worker_command(task: &QueuedTask) -> Result<Command> {
                 "--disable",
                 "apps",
                 "-c",
-                "mcp_servers.runspur_scheduler.enabled=false",
+                // Override the whole table. A disabled entry without a transport is invalid.
+                "mcp_servers={}",
             ]);
             if let Some(model) = &task.profile.model {
                 command.arg(format!("--model={model}"));
@@ -272,16 +295,22 @@ pub fn worker_command(task: &QueuedTask) -> Result<Command> {
             command.arg("-");
         }
         AgentKind::ClaudePrint => {
+            if scoped {
+                configure_scoped_claude(&mut command, attempt_dir, task.execution_mode)?;
+            } else {
+                command.args([
+                    "--safe-mode",
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    "{\"mcpServers\":{}}",
+                    "--tools",
+                    "Read,Grep,Glob",
+                    "--permission-mode",
+                    "plan",
+                ]);
+            }
             command.args([
-                "--safe-mode",
                 "--disable-slash-commands",
-                "--strict-mcp-config",
-                "--mcp-config",
-                "{\"mcpServers\":{}}",
-                "--tools",
-                "Read,Grep,Glob",
-                "--permission-mode",
-                "plan",
                 "--no-chrome",
                 "--no-session-persistence",
                 "--print",
@@ -305,6 +334,125 @@ pub fn worker_command(task: &QueuedTask) -> Result<Command> {
     }
     configure_suspended(&mut command);
     Ok(command)
+}
+
+fn configure_scoped_claude(
+    command: &mut Command,
+    attempt_dir: &Path,
+    mode: ExecutionMode,
+) -> Result<()> {
+    let broker = std::env::current_exe()?
+        .with_file_name(format!("scheduler-mcp{}", std::env::consts::EXE_SUFFIX));
+    if !broker.is_file() {
+        bail!("The scheduler's scoped file MCP executable is missing");
+    }
+    let mcp = serde_json::json!({
+        "mcpServers": {
+            scoped_files::BROKER_SERVER: {
+                "command": broker,
+                "args": ["--worker-file-broker", scoped_files::ScopedWorkspace::ticket(attempt_dir).to_str().context("The attempt path is not UTF-8")?],
+            },
+        },
+    });
+    // Preserve explicit provider authentication and model keys without loading plugins or hooks.
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    if let Some(home) = home {
+        let path = PathBuf::from(home).join(".claude/settings.json");
+        if let Ok(file) = std::fs::File::open(path)
+            && let Ok(settings) = serde_json::from_reader(std::io::Read::take(file, 1024 * 1024))
+        {
+            for (key, value) in claude_auth_environment(&settings) {
+                if !command.as_std().get_envs().any(|(name, _)| name == key) {
+                    command.env(key, value);
+                }
+            }
+        }
+    }
+    let write_instructions = match mode {
+        ExecutionMode::ProjectWrite => {
+            "Use the Runspur file tools for text changes anywhere within the project. Use project-relative paths. Changes are isolated in the task workspace. Return a short summary of your work."
+        }
+        ExecutionMode::WorkspaceWrite => {
+            "Use the Runspur file tools for workspace changes. Paths are project-relative, and only the task's authorized paths can be written. Return a short summary of your work."
+        }
+        ExecutionMode::ReadOnly => bail!("Read-only workers cannot launch the write broker"),
+    };
+    command
+        .env("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
+        .env("ENABLE_TOOL_SEARCH", "false")
+        .args([
+            "--setting-sources",
+            "",
+            "--settings",
+            "{\"disableAllHooks\":true,\"disableClaudeAiConnectors\":true,\"autoMemoryEnabled\":false}",
+            "--strict-mcp-config",
+            "--mcp-config",
+            &mcp.to_string(),
+            "--tools",
+            "",
+            "--allowed-tools",
+            &scoped_files::BROKER_TOOLS.join(","),
+            "--permission-mode",
+            "dontAsk",
+            "--append-system-prompt",
+            write_instructions,
+        ]);
+    Ok(())
+}
+
+fn claude_auth_environment(settings: &serde_json::Value) -> Vec<(&'static str, &str)> {
+    SCOPED_CLAUDE_AUTH_KEYS
+        .iter()
+        .filter_map(|&key| settings["env"][key].as_str().map(|value| (key, value)))
+        .collect()
+}
+
+async fn scoped_workspace(
+    task: &QueuedTask,
+    attempt_dir: &Path,
+) -> Result<Option<scoped_files::ScopedWorkspace>> {
+    let scope = match task.execution_mode {
+        ExecutionMode::ReadOnly => return Ok(None),
+        ExecutionMode::WorkspaceWrite if !task.write_scope.is_empty() => {
+            Some(task.write_scope.as_slice())
+        }
+        ExecutionMode::ProjectWrite if task.write_scope.is_empty() => None,
+        ExecutionMode::WorkspaceWrite | ExecutionMode::ProjectWrite => {
+            bail!("Worker write scope does not match its execution mode")
+        }
+    };
+    if !matches!(task.profile.kind, AgentKind::ClaudePrint) {
+        bail!("This worker does not support scoped writes");
+    }
+    let program = resolve_program(
+        task.profile
+            .program
+            .as_deref()
+            .context("Worker has no executable")?,
+    )?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(program)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout.trim().strip_suffix(" (Claude Code)");
+    if !output.status.success()
+        || !version.is_some_and(|value| SCOPED_CLAUDE_VERSIONS.contains(&value))
+    {
+        bail!(
+            "Scoped writes require a verified Claude Code version ({})",
+            SCOPED_CLAUDE_VERSIONS.join(" or ")
+        );
+    }
+    Ok(Some(scoped_files::ScopedWorkspace::prepare(
+        &task.project_root,
+        attempt_dir,
+        scope,
+    )?))
 }
 
 async fn line_bounded<R: AsyncRead + Unpin>(
@@ -334,6 +482,7 @@ async fn read_output<R: AsyncRead + Unpin>(
     stream: R,
     path: PathBuf,
     kind: Option<AgentKind>,
+    mut scoped_start_pending: bool,
 ) -> Result<ParsedWorker> {
     let mut file = File::create_new(path).await?;
     let mut reader = BufReader::new(stream);
@@ -348,6 +497,14 @@ async fn read_output<R: AsyncRead + Unpin>(
             }
             let mut event: serde_json::Value = serde_json::from_str(text)
                 .context("Worker stdout is not the declared JSONL protocol")?;
+            if scoped_start_pending {
+                if event["type"] == "system" && event["subtype"] == "init" {
+                    verify_scoped_claude_startup(&event)?;
+                    scoped_start_pending = false;
+                } else if event["type"] != "system" {
+                    bail!("Claude did not report the verified scoped tool configuration");
+                }
+            }
             parsed.consume(kind, &event)?;
             redact_json(&mut event);
             format!("{}\n", serde_json::to_string(&event)?)
@@ -361,9 +518,36 @@ async fn read_output<R: AsyncRead + Unpin>(
             parsed.log_truncated = true;
         }
     }
+    if scoped_start_pending {
+        bail!("Claude did not report the verified scoped tool configuration");
+    }
     file.sync_all().await?;
     parsed.summary = redact_text(&parsed.summary);
     Ok(parsed)
+}
+
+fn verify_scoped_claude_startup(event: &serde_json::Value) -> Result<()> {
+    let tools = event["tools"]
+        .as_array()
+        .context("Claude startup has no tool list")?;
+    let servers = event["mcp_servers"]
+        .as_array()
+        .context("Claude startup has no MCP server list")?;
+    if !event["claude_code_version"]
+        .as_str()
+        .is_some_and(|version| SCOPED_CLAUDE_VERSIONS.contains(&version))
+        || event["permissionMode"] != "dontAsk"
+        || tools.len() != scoped_files::BROKER_TOOLS.len()
+        || !scoped_files::BROKER_TOOLS
+            .iter()
+            .all(|name| tools.iter().any(|tool| tool == name))
+        || servers.len() != 1
+        || servers[0]["name"] != scoped_files::BROKER_SERVER
+        || servers[0]["status"] != "connected"
+    {
+        bail!("Claude did not start with only the verified Runspur file tools");
+    }
+    Ok(())
 }
 
 enum End {
@@ -385,7 +569,20 @@ pub async fn run_worker(
     if task.view.cancel_requested || cancel.is_cancelled() {
         return Ok(stopped(task, ExecutionState::Canceled, "canceled"));
     }
-    let mut command = worker_command(task)?;
+    let workspace = match scoped_workspace(task, &directory).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return Ok(failed(
+                task,
+                "workspace_write_unavailable",
+                redact_text(&error.to_string()),
+            ));
+        }
+    };
+    if cancel.is_cancelled() {
+        return Ok(stopped(task, ExecutionState::Canceled, "canceled"));
+    }
+    let mut command = worker_command(task, &directory)?;
     let job = Arc::new(WorkerJob::new()?);
     let mut child = command.spawn().context("Cannot start worker executable")?;
     let pid = child.id().context("Worker PID unavailable")?;
@@ -404,14 +601,7 @@ pub async fn run_worker(
     let stdin = child.stdin.take().context("Worker stdin unavailable")?;
     let stdout = child.stdout.take().context("Worker stdout unavailable")?;
     let stderr = child.stderr.take().context("Worker stderr unavailable")?;
-    let prompt = if task.profile.kind == AgentKind::Probe {
-        task.prompt.clone()
-    } else {
-        format!(
-            "独立只读子任务，task_id={}。请只处理所给任务并给出最终摘要；调度器负责结果交付。\n\n{}",
-            task.view.task_id, task.prompt
-        )
-    };
+    let prompt = task.prompt.clone();
     let mut input = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(10), async move {
             let mut stdin = stdin;
@@ -426,8 +616,14 @@ pub async fn run_worker(
         stdout,
         directory.join("stdout.jsonl"),
         Some(task.profile.kind.clone()),
+        workspace.is_some(),
     ));
-    let mut errors = tokio::spawn(read_output(stderr, directory.join("stderr.log"), None));
+    let mut errors = tokio::spawn(read_output(
+        stderr,
+        directory.join("stderr.log"),
+        None,
+        false,
+    ));
     if let Err(error) = resume_suspended(pid) {
         let _ = job.terminate();
         input.abort();
@@ -579,6 +775,29 @@ pub async fn run_worker(
             outcome: "truncated at 8 MiB".into(),
         });
     }
+    if let Some(workspace) = workspace {
+        let prefix = format!("{}/{}", task.view.task_id, task.attempt_id);
+        match workspace.capture_changes(&directory, &prefix) {
+            Ok(artifact) => {
+                let outcome = if let Some(artifact) = artifact {
+                    result.result.artifact_refs.push(artifact);
+                    "captured"
+                } else {
+                    "no changes"
+                };
+                result.result.verification.push(Verification {
+                    description: "scoped_workspace_changes".into(),
+                    outcome: outcome.into(),
+                });
+            }
+            Err(error) if result.execution_state == ExecutionState::Succeeded => {
+                result.execution_state = ExecutionState::Failed;
+                result.result.error_class = Some("workspace_artifact_failed".into());
+                result.result.summary = redact_text(&error.to_string());
+            }
+            Err(_) => {}
+        }
+    }
     Ok(result)
 }
 
@@ -607,6 +826,39 @@ fn stopped(task: &QueuedTask, state: ExecutionState, class: &str) -> Completion 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scoped_claude_requires_a_verified_build_and_only_the_broker_tools() {
+        let mut startup = serde_json::json!({
+            "claude_code_version": "2.1.220",
+            "permissionMode": "dontAsk",
+            "tools": scoped_files::BROKER_TOOLS,
+            "mcp_servers": [{"name": scoped_files::BROKER_SERVER, "status": "connected"}],
+        });
+        assert!(verify_scoped_claude_startup(&startup).is_ok());
+        startup["claude_code_version"] = serde_json::json!("2.1.319");
+        assert!(verify_scoped_claude_startup(&startup).is_ok());
+        startup["claude_code_version"] = serde_json::json!("2.1.320");
+        assert!(verify_scoped_claude_startup(&startup).is_err());
+        startup["claude_code_version"] = serde_json::json!("2.1.319");
+        startup["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("Bash"));
+        assert!(verify_scoped_claude_startup(&startup).is_err());
+    }
+    #[test]
+    fn scoped_claude_imports_auth_without_importing_host_configuration() {
+        let settings = serde_json::json!({"env": {
+            "ANTHROPIC_BASE_URL": "https://gateway.invalid",
+            "ANTHROPIC_MODEL": "test-model",
+            "ENABLE_TOOL_SEARCH": "true",
+            "NODE_OPTIONS": "--require unrelated.js"
+        }});
+        let environment = claude_auth_environment(&settings);
+        assert!(environment.contains(&("ANTHROPIC_BASE_URL", "https://gateway.invalid")));
+        assert!(environment.contains(&("ANTHROPIC_MODEL", "test-model")));
+        assert_eq!(environment.len(), 2);
+    }
     #[test]
     fn structured_results_are_required_and_provider_specific() {
         let mut codex = ParsedWorker::default();

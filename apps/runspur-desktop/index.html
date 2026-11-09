@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/src-tauri/icons/icon.svg?no-inline" />
+    <title>Runspur Desktop</title>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="wordmark">
+        <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M9 23V9h10l4 4-4 4h-4l8 6M15 13h4" />
+        </svg>
+        <span>Runspur</span>
+      </div>
+      <nav aria-label="Runspur">
+        <button id="projects-nav" class="nav-button" type="button" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5h6l2 2h9v12H3Z" /></svg>
+          <span data-i18n="projects">Projects</span>
+        </button>
+        <button id="history-nav" class="nav-button" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7.5V12l3 2" /></svg>
+          <span data-i18n="history">Dispatch history</span>
+        </button>
+        <button id="overview-nav" class="nav-button" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h4l3-6 4 10 3-4h4" /></svg>
+          <span data-i18n="overview">Overview</span>
+        </button>
+        <button id="settings-nav" class="nav-button" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16M8 5v4m8 1v4m-5 1v4" /></svg>
+          <span data-i18n="settings">Settings</span>
+        </button>
+      </nav>
+      <div class="header-status" aria-live="polite">
+        <span id="indicator" class="indicator" aria-hidden="true"></span>
+        <div>
+          <span id="rail-status" class="rail-status">Connecting</span>
+          <span class="channel" id="channel" hidden></span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section id="projects" aria-label="Projects" data-i18n-label="projects">
+        <div id="project-home">
+          <div class="section-heading">
+            <div>
+              <h1 id="projects-title" data-i18n="projects">Projects</h1>
+              <p data-i18n="projectsIntro">Manage project integrations and dispatch history.</p>
+            </div>
+            <button id="choose-project" type="button" class="add-button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+              <span data-i18n="chooseProject">Add project</span>
+            </button>
+          </div>
+          <p id="projects-notice" class="notice" aria-live="polite"></p>
+          <h2 class="list-heading" data-i18n="registeredProjects">Registered projects</h2>
+          <div id="project-list" class="entry-list project-list"></div>
+          <div id="project-empty" class="project-empty" hidden>
+            <span class="empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M3 7V5h6l2 2h9v12H3Z" /></svg>
+            </span>
+            <h3 data-i18n="noProjects">No projects yet</h3>
+            <p data-i18n="projectEmpty">Choose a folder to configure its agents and track its dispatches here.</p>
+          </div>
+        </div>
+        <section id="project-setup" aria-labelledby="project-setup-title" hidden>
+          <header class="project-setup-header">
+            <button id="close-project-setup" class="text-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 6-6 6 6 6M7 12h13" /></svg>
+              <span data-i18n="backToProjects">Back to projects</span>
+            </button>
+            <div class="setup-titlebar">
+              <h1 id="project-setup-title">Add project</h1>
+              <ol class="setup-steps" aria-label="Setup" data-i18n-label="projectSetup">
+                <li id="configure-step" aria-current="step"><span aria-hidden="true">1</span><b data-i18n="projectConfiguration">Configure</b></li>
+                <li id="review-step"><span aria-hidden="true">2</span><b data-i18n="projectReview">Review</b></li>
+              </ol>
+            </div>
+            <div class="project-location">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5h6l2 2h9v12H3Z" /></svg>
+              <div>
+                <span data-i18n="projectFolder">Project folder</span>
+                <code id="project-root"></code>
+              </div>
+            </div>
+            <p id="project-registered-note" class="notice" data-i18n="projectAlreadyConnected" hidden>This folder is already connected. Saving will update the existing project.</p>
+          </header>
+          <form id="project-form" hidden>
+            <div class="project-fields">
+              <div class="field">
+                <label for="project-name" data-i18n="projectName">Project name</label>
+                <input id="project-name" type="text" required />
+              </div>
+              <div class="field">
+                <label for="parent-agent" data-i18n="parentAgent">Main agent</label>
+                <select id="parent-agent" required></select>
+              </div>
+            </div>
+            <div class="project-workers">
+              <fieldset class="worker-picker" aria-describedby="worker-hint">
+                <legend data-i18n="workerAgents">Worker agents</legend>
+                <div id="worker-agents"></div>
+                <p id="worker-hint" data-i18n="chooseWorker" hidden>Select at least one available worker agent.</p>
+              </fieldset>
+              <button id="refresh-agents" type="button" class="text-button" data-i18n="refreshAgents">Refresh agents</button>
+            </div>
+            <fieldset id="worker-file-access" class="permission-group" aria-describedby="worker-access-hint">
+              <legend data-i18n="workerWritePolicy">Worker file access</legend>
+              <p id="worker-access-hint" data-i18n="workerAccessHint" aria-live="polite">Worker changes are collected for review.</p>
+              <div class="permission-options">
+                <label class="permission-option">
+                  <input type="radio" name="worker-access" value="read_only" checked aria-labelledby="read-only-label" aria-describedby="read-only-hint" />
+                  <span><strong id="read-only-label" data-i18n="workerReadOnly">Read only</strong><small id="read-only-hint" data-i18n="workerReadOnlyHint">Inspect project files and report findings.</small></span>
+                </label>
+                <label class="permission-option">
+                  <input type="radio" name="worker-access" value="workspace_write" aria-labelledby="scoped-write-label" aria-describedby="scoped-write-hint" />
+                  <span><strong id="scoped-write-label" data-i18n="workerScopedWrite">Specified files</strong><small id="scoped-write-hint" data-i18n="workerScopedWriteHint">Edit task-listed files in an isolated workspace.</small></span>
+                </label>
+                <label class="permission-option">
+                  <input type="radio" name="worker-access" value="project_write" aria-labelledby="project-write-label" aria-describedby="project-write-hint" />
+                  <span><strong id="project-write-label" data-i18n="workerProjectWrite">Project-wide text edits</strong><small id="project-write-hint" data-i18n="workerProjectWriteHint">Edit text across an isolated project workspace.</small></span>
+                </label>
+              </div>
+            </fieldset>
+            <div class="setup-actions">
+              <button id="preview-project" type="submit" data-i18n="previewProject">Preview integration</button>
+            </div>
+          </form>
+          <section id="project-preview" aria-labelledby="preview-title" hidden>
+            <h2 id="preview-title" data-i18n="previewProject" tabindex="-1">Preview integration</h2>
+            <p data-i18n="integrationScope">Confirm to save the project manifest, Skill and main agent configuration.</p>
+            <dl class="review-summary">
+              <div><dt data-i18n="projectName">Project name</dt><dd id="preview-name"></dd></div>
+              <div><dt data-i18n="parentAgent">Main agent</dt><dd id="preview-parent"></dd></div>
+              <div><dt data-i18n="workerAgents">Worker agents</dt><dd id="preview-workers"></dd></div>
+              <div>
+                <dt data-i18n="workerWritePolicy">Worker file access</dt>
+                <dd><span id="preview-write-policy"></span><small id="preview-write-detail"></small></dd>
+              </div>
+            </dl>
+            <div class="preview-files">
+              <div class="preview-file">
+                <strong data-i18n="projectManifest">Project manifest</strong>
+                <code id="preview-manifest"></code>
+              </div>
+              <details id="preview-skill">
+                <summary>
+                  <strong data-i18n="projectSkill">Skill</strong>
+                  <code id="preview-skill-path"></code>
+                </summary>
+                <pre id="preview-skill-content" class="task-text" tabindex="0"></pre>
+              </details>
+              <details id="preview-mcp">
+                <summary>
+                  <strong data-i18n="projectMcp">Runspur MCP entry</strong>
+                  <code id="preview-mcp-path"></code>
+                </summary>
+                <pre id="preview-mcp-content" class="task-text" tabindex="0"></pre>
+              </details>
+                <details id="preview-hook" hidden>
+                  <summary>
+                    <strong data-i18n="projectClaudeHook">Claude Code project hook</strong>
+                    <code id="preview-hook-path"></code>
+                  </summary>
+                  <pre id="preview-hook-content" class="task-text" tabindex="0"></pre>
+                </details>
+            </div>
+            <section id="preview-cleanup" class="preview-cleanup" aria-labelledby="preview-cleanup-title" hidden>
+              <h3 id="preview-cleanup-title" data-i18n="projectCleanup">Previous integration entries to remove</h3>
+              <div id="preview-cleanup-items" class="preview-files"></div>
+            </section>
+            <div class="setup-actions">
+              <button id="edit-project" class="secondary" type="button" data-i18n="editProject">Edit configuration</button>
+              <button id="apply-project" type="button">Confirm and connect</button>
+            </div>
+          </section>
+        </section>
+        <p id="project-feedback" class="notice" aria-live="polite"></p>
+      </section>
+      <section id="history" aria-labelledby="history-title" hidden>
+        <div class="section-heading">
+          <div>
+            <h1 id="history-title" data-i18n="history">Dispatch history</h1>
+            <p data-i18n="historyIntro">Inspect each dispatch, its execution, and delivery back to the main agent.</p>
+          </div>
+          <button id="refresh-history" class="secondary" type="button" data-i18n="refresh">Refresh</button>
+        </div>
+        <div class="history-tools">
+          <label class="history-filter" for="history-project">
+            <span data-i18n="filterProject">Project</span>
+            <select id="history-project" disabled></select>
+          </label>
+          <label class="history-filter" for="history-session">
+            <span data-i18n="filterSession">Session</span>
+            <select id="history-session" disabled></select>
+          </label>
+          <button id="load-sessions" class="secondary" type="button" data-i18n="olderSessions" hidden>Load older sessions</button>
+          <button id="resume-claude-session" class="text-button" type="button" data-i18n="resumeClaudeSession" hidden>Resume Claude session</button>
+        </div>
+        <p id="history-notice" class="notice" aria-live="polite"></p>
+        <div class="workspace-grid history-grid">
+          <div class="master-pane">
+            <h2 data-i18n="dispatches">Dispatches</h2>
+            <div id="history-list" class="entry-list"></div>
+            <button id="load-history" class="secondary load-more" type="button" data-i18n="olderDispatches" hidden>Load older dispatches</button>
+          </div>
+          <div class="detail-pane" id="history-inspector" hidden>
+            <p id="task-empty" class="empty-state" data-i18n="taskEmpty">Select a dispatch to see its prompt, result, and delivery details.</p>
+            <article id="task-detail" hidden>
+              <div class="section-heading task-heading">
+                <h2 data-i18n="dispatchDetails">Dispatch details</h2>
+                <button id="cancel-task" class="secondary danger" type="button" data-i18n="cancelTask" hidden>Cancel dispatch</button>
+              </div>
+              <p id="task-notice" class="notice" aria-live="polite"></p>
+              <div id="task-content"></div>
+            </article>
+          </div>
+        </div>
+      </section>
+      <section id="overview" aria-labelledby="scheduler-title" hidden>
+        <div class="section-heading">
+          <h1 id="scheduler-title" data-i18n="localScheduler">Local scheduler</h1>
+          <button id="refresh" class="secondary" type="button" data-i18n="refresh" disabled>Refresh</button>
+        </div>
+        <div class="connection" aria-live="polite">
+          <div class="connection-status">
+            <strong id="status">Checking connection</strong>
+          </div>
+          <p id="detail">Checking the scheduler included with Runspur Desktop.</p>
+        </div>
+        <dl class="readout">
+          <div><dt data-i18n="serviceVersion">Service version</dt><dd id="version">—</dd></div>
+          <div><dt data-i18n="protocol">Protocol</dt><dd id="protocol">—</dd></div>
+          <div><dt data-i18n="workers">Active workers</dt><dd id="workers">—</dd></div>
+        </dl>
+        <div class="actions">
+          <button id="start" type="button" hidden>Start scheduler</button>
+        </div>
+      </section>
+      <section id="settings" aria-labelledby="settings-title" hidden>
+        <div class="section-heading">
+          <h1 id="settings-title" data-i18n="settings">Settings</h1>
+        </div>
+        <h2 data-i18n="application">Application</h2>
+        <div class="setting-row">
+          <div>
+            <label for="language-setting" data-i18n="language">Language</label>
+            <p id="language-hint" data-i18n="languageHint">Choose the language used by Runspur Desktop.</p>
+          </div>
+          <select id="language-setting" aria-describedby="language-hint" disabled>
+            <option value="system" data-i18n="systemLanguage">Use system language</option>
+            <option value="en" lang="en">English</option>
+            <option value="zh-CN" lang="zh-CN">简体中文</option>
+          </select>
+        </div>
+        <p id="settings-message" class="settings-message" aria-live="polite"></p>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -11,11 +11,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::codex_host::{CodexHost, classify_codex_host};
 use crate::{DeliveryOutcome, ParentAdapter, ResolvedParent};
 
 const PIPE: &str = r"\\.\pipe\codex-ipc";
 const MAX_NATIVE_FRAME: usize = 16 * 1024 * 1024;
 const VERIFIED_ASAR: &str = "fb47d6491dc3006b708cb1e14de479b882bf50f88b7daa81818f154c253266aa";
+
+pub fn codex_mcp_origin(thread_id: Option<&Value>) -> scheduler_core::Result<OriginSession> {
+    let id = thread_id
+        .and_then(Value::as_str)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .ok_or_else(|| {
+            SchedulerError::new(
+                "origin_session_unavailable",
+                "Codex did not provide a valid thread ID on this tool call",
+            )
+        })?;
+    Ok(OriginSession {
+        provider_session_id: id.into(),
+        source: OriginSource::RequestMetadata,
+    })
+}
 
 #[derive(Default)]
 pub struct CodexDesktopAdapter {
@@ -280,6 +297,30 @@ impl CodexDesktopAdapter {
 impl ParentAdapter for CodexDesktopAdapter {
     fn id(&self) -> &'static str {
         "codex-desktop"
+    }
+    fn profile_kind(&self) -> scheduler_core::AgentKind {
+        scheduler_core::AgentKind::CodexDesktop
+    }
+    fn family(&self) -> &'static str {
+        "codex"
+    }
+    async fn resolve_from_peer(
+        &self,
+        project: &ProjectRecord,
+        origin: &OriginSession,
+        peer: &ProcessIdentity,
+    ) -> Result<ResolvedParent> {
+        match classify_codex_host(peer) {
+            CodexHost::DesktopProcess => self.resolve(project, origin).await,
+            CodexHost::LocalCli => Err(SchedulerError::new(
+                "codex_cli_return_unavailable",
+                "Detected Codex in a terminal process. Active return to this terminal session is not available.",
+            ).into()),
+            CodexHost::Unknown => Err(SchedulerError::new(
+                "origin_session_unavailable",
+                "Runspur could not verify the local host of this Codex tool call.",
+            ).into()),
+        }
     }
     async fn resolve(
         &self,

@@ -3,6 +3,11 @@
 /dist/
 **/*.rs.bk
 
+# Local development instructions, checks, and output.
+/AGENTS.md
+/.runspur-local/
+/scripts/test-desktop-install.ps1
+
 # Project policy is versioned; local state and credentials are not.
 /.agent-scheduler/local/
 /artifacts/
@@ -15,7 +20,5 @@
 .env.*
 !.env.example
 
-# Internal plans, contracts, task boards, and local research.
-/docs/
-/windows-desktop-verification-2026-11-08.md
-/windows-native-bidirectional-agent-scheduler-design.md
+# Internal documentation.
+/docs/internal/

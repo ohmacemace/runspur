@@ -1,6 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use scheduler_core::{DeliveryEnvelope, OriginSession, ParentRoute, ProjectRecord, Registration};
+use scheduler_core::{
+    AgentKind, DeliveryEnvelope, OriginSession, OriginSource, ParentRoute, ProcessIdentity,
+    ProjectRecord, Registration,
+};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedParent {
@@ -11,7 +14,11 @@ pub struct ResolvedParent {
 
 #[derive(Debug)]
 pub enum DeliveryOutcome {
-    Accepted { parent_turn_id: String },
+    Accepted {
+        parent_turn_id: String,
+    },
+    /// The host confirmed delivery without a turn or comparable transport reference.
+    AcceptedWithoutReference,
     Busy,
     Held(String),
     Refused(String),
@@ -22,11 +29,35 @@ pub enum DeliveryOutcome {
 #[async_trait]
 pub trait ParentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
+    fn profile_kind(&self) -> AgentKind;
+    fn family(&self) -> &'static str;
     async fn resolve(
         &self,
         project: &ProjectRecord,
         origin: &OriginSession,
     ) -> Result<ResolvedParent>;
+    async fn resolve_from_peer(
+        &self,
+        project: &ProjectRecord,
+        origin: &OriginSession,
+        _peer: &ProcessIdentity,
+    ) -> Result<ResolvedParent> {
+        self.resolve(project, origin).await
+    }
+    async fn refresh(
+        &self,
+        project: &ProjectRecord,
+        registration: &Registration,
+    ) -> Result<ResolvedParent> {
+        self.resolve(
+            project,
+            &OriginSession {
+                provider_session_id: registration.route.session_id.clone(),
+                source: OriginSource::RequestMetadata,
+            },
+        )
+        .await
+    }
     async fn deliver(
         &self,
         registration: &Registration,

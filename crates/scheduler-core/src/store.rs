@@ -15,6 +15,11 @@ pub struct Store {
     connection: Arc<Mutex<Connection>>,
 }
 
+enum HistoryFilter {
+    Origin(String),
+    LegacySession(String),
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
@@ -64,6 +69,7 @@ impl Store {
               cancel_requested INTEGER NOT NULL DEFAULT 0,
               UNIQUE(registration_id, idempotency_key));
             CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(execution_state, created_at_ms, sequence);
+            CREATE INDEX IF NOT EXISTS tasks_project_history ON tasks(project_id, sequence);
             CREATE TABLE IF NOT EXISTS attempts (
               id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
               pid INTEGER, process_start INTEGER, started_at_ms INTEGER, finished_at_ms INTEGER,
@@ -124,42 +130,61 @@ impl Store {
 
     pub async fn profile(&self, id: &str) -> Result<AgentProfile> {
         let id = id.to_owned();
-        self.run(move |c| {
-            let body = c
-                .query_row("SELECT body FROM profiles WHERE id=?1", [id], |r| r.get(0))
-                .optional()?
-                .ok_or_else(|| {
-                    SchedulerError::new("profile_not_found", "Agent profile was not found")
-                })?;
-            decode(body)
-        })
-        .await
+        self.run(move |c| get_profile(c, &id)).await
     }
 
     pub async fn put_project(&self, mut project: ProjectRecord) -> Result<ProjectRecord> {
         validate_project(&project.config)?;
+        let expected_revision = std::mem::take(&mut project.revision);
         project.revision = fingerprint(&project.config)?;
         self.run(move |c| {
+            let tx = c.transaction()?;
             let root = project.root.to_str().ok_or_else(|| {
                 SchedulerError::new(
                     "invalid_path",
                     "Project root must be representable in the JSON protocol",
                 )
             })?;
-            let old: Option<String> = c
+            let old: Option<String> = tx
                 .query_row(
-                    "SELECT root FROM projects WHERE id=?1",
+                    "SELECT body FROM projects WHERE id=?1",
                     [&project.config.project_id],
                     |r| r.get(0),
                 )
                 .optional()?;
-            if old.as_deref().is_some_and(|p| p != root) {
-                return Err(SchedulerError::new(
-                    "project_root_mismatch",
-                    "Moving a registered project requires explicit migration",
-                ));
+            if let Some(old) = old {
+                let old: ProjectRecord = decode(old)?;
+                if old.root != project.root {
+                    return Err(SchedulerError::new(
+                        "project_root_mismatch",
+                        "Moving a registered project requires explicit migration",
+                    ));
+                }
+                if !expected_revision.is_empty() && old.revision != expected_revision {
+                    return Err(SchedulerError::new(
+                        "project_revision_changed",
+                        "Project registration changed after preview. Preview it again.",
+                    ));
+                }
+                if old.config.main_agent_profile_id != project.config.main_agent_profile_id {
+                    let pending: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tasks t
+                         LEFT JOIN outbox o ON o.task_id=t.id
+                         WHERE t.project_id=?1 AND
+                         (t.execution_state NOT IN ('succeeded','failed','canceled','timed_out')
+                          OR o.state NOT IN ('acknowledged_by_parent','refused')))",
+                        [&project.config.project_id],
+                        |r| r.get(0),
+                    )?;
+                    if pending {
+                        return Err(SchedulerError::new(
+                            "project_switch_busy",
+                            "Finish the project's running tasks and pending returns before changing its main agent.",
+                        ));
+                    }
+                }
             }
-            c.execute(
+            tx.execute(
                 "INSERT INTO projects(id,root,revision,body) VALUES(?1,?2,?3,?4)
                 ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, body=excluded.body",
                 params![
@@ -169,6 +194,7 @@ impl Store {
                     encode(&project)?
                 ],
             )?;
+            tx.commit()?;
             Ok(project)
         })
         .await
@@ -269,6 +295,51 @@ impl Store {
     }
 
     pub async fn submit(&self, auth: &AuthContext, submission: SubmitTask) -> Result<TaskAccepted> {
+        self.submit_checked(auth, submission, |_, _, profile, request| {
+            if matches!(profile.kind, AgentKind::CodexDesktop) {
+                return Err(SchedulerError::new(
+                    "worker_not_supported",
+                    "Desktop parent profile is not a worker executor",
+                ));
+            }
+            if !request.execution_mode.is_read_only() {
+                return Err(SchedulerError::new(
+                    "worker_not_supported",
+                    "Writing requires an authorized worker adapter",
+                ));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn submit_with_worker_policy(
+        &self,
+        auth: &AuthContext,
+        submission: SubmitTask,
+        validate: impl FnOnce(&AgentProfile, &AgentProfile, &SubmitTask, &Registration) -> Result<()>
+        + Send
+        + 'static,
+    ) -> Result<TaskAccepted> {
+        self.submit_checked(
+            auth,
+            submission,
+            move |tx, registration, profile, request| {
+                let main = get_profile(tx, &registration.main_agent_profile_id)?;
+                validate(&main, profile, request, registration)
+            },
+        )
+        .await
+    }
+
+    async fn submit_checked(
+        &self,
+        auth: &AuthContext,
+        submission: SubmitTask,
+        validate: impl FnOnce(&Transaction<'_>, &Registration, &AgentProfile, &SubmitTask) -> Result<()>
+        + Send
+        + 'static,
+    ) -> Result<TaskAccepted> {
         let (project_id, registration_id) = auth.root()?;
         let project_id = project_id.to_owned();
         let registration_id = registration_id.to_owned();
@@ -299,12 +370,8 @@ impl Store {
             if count >= project.config.limits.max_dispatches_per_root {
                 return Err(SchedulerError::new("dispatch_limit_reached", "Root dispatch limit reached"));
             }
-            let profile: AgentProfile = decode(tx.query_row("SELECT body FROM profiles WHERE id=?1",
-                [&submission.worker_profile_id], |r| r.get(0)).optional()?
-                .ok_or_else(|| SchedulerError::new("profile_not_found", "Worker profile is not configured"))?)?;
-            if matches!(profile.kind, AgentKind::CodexDesktop) {
-                return Err(SchedulerError::new("worker_not_supported", "Desktop parent profile is not a worker executor"));
-            }
+            let profile = get_profile(&tx, &submission.worker_profile_id)?;
+            validate(&tx, &registration, &profile, &submission)?;
             let view = TaskView { task_id: new_id(), project_id: project_id.clone(),
                 parent_registration_id: registration_id.clone(), root_task_id: registration.root_task_id,
                 workspace_root: registration.workspace_root.clone(),
@@ -313,7 +380,8 @@ impl Store {
                 finished_at_ms: None, result: None, delivery_id: new_id(), delivery_error: None,
                 parent_turn_id: None, cancel_requested: false };
             let spec = QueuedTask { view: view.clone(), prompt: submission.prompt, timeout_seconds: timeout,
-                project_root: registration.workspace_root, project_config: project.config, profile, attempt_id: new_id() };
+                project_root: registration.workspace_root, project_config: project.config, profile, attempt_id: new_id(),
+                execution_mode: submission.execution_mode, write_scope: submission.write_scope };
             tx.execute("INSERT INTO tasks(id,project_id,registration_id,root_task_id,idempotency_key,fingerprint,spec,body,execution_state,created_at_ms)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9)",
                 params![view.task_id, project_id, registration_id, view.root_task_id, submission.idempotency_key,
@@ -336,6 +404,32 @@ impl Store {
         .await
     }
 
+    pub async fn task_for_delivery(
+        &self,
+        auth: &AuthContext,
+        delivery_id: &str,
+    ) -> Result<TaskView> {
+        auth.root()?;
+        let auth = auth.clone();
+        let delivery_id = delivery_id.to_owned();
+        self.run(move |c| {
+            let task_id: String = c
+                .query_row(
+                    "SELECT task_id FROM outbox WHERE delivery_id=?1",
+                    [&delivery_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    SchedulerError::new("delivery_not_found", "Delivery was not found")
+                })?;
+            let task = get_task(c, &task_id)?;
+            auth.can_access(&task.project_id, &task.parent_registration_id)?;
+            Ok(task)
+        })
+        .await
+    }
+
     pub async fn list_tasks(&self, auth: &AuthContext, limit: u32) -> Result<Vec<TaskView>> {
         let auth = auth.clone();
         let limit = limit.clamp(1, 200);
@@ -352,6 +446,173 @@ impl Store {
             };
             rows.into_iter().map(decode).collect()
         }).await
+    }
+
+    pub async fn task_history(
+        &self,
+        auth: &AuthContext,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<TaskPage> {
+        if project_id.is_none() && session_id.is_some() {
+            auth.require_admin()?;
+            return Err(SchedulerError::new(
+                "project_required",
+                "A session filter requires a project",
+            ));
+        }
+        self.read_task_history(
+            auth,
+            project_id.map(str::to_owned),
+            session_id.map(|id| HistoryFilter::LegacySession(id.to_owned())),
+            before,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn origin_task_history(
+        &self,
+        auth: &AuthContext,
+        project_id: &str,
+        origin_id: &str,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<TaskPage> {
+        self.read_task_history(
+            auth,
+            Some(project_id.to_owned()),
+            Some(HistoryFilter::Origin(origin_id.to_owned())),
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn read_task_history(
+        &self,
+        auth: &AuthContext,
+        project_id: Option<String>,
+        filter: Option<HistoryFilter>,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<TaskPage> {
+        auth.require_admin()?;
+        let through = before.map_or(i64::MAX, |cursor| cursor.saturating_sub(1));
+        let limit = limit.clamp(1, 50);
+        self.run(move |c| {
+            let origin_id = match (filter, &project_id) {
+                (Some(HistoryFilter::Origin(id)), _) => Some(id),
+                (Some(HistoryFilter::LegacySession(id)), Some(project)) => {
+                    let Some(origin) = resolve_legacy_origin(c, project, &id)? else {
+                        return Ok(TaskPage { items: Vec::new(), next_cursor: None });
+                    };
+                    Some(origin)
+                }
+                _ => None,
+            };
+            let sql = match (&project_id, &origin_id) {
+                (Some(_), Some(_)) => "SELECT sequence,body FROM tasks
+                    WHERE sequence<=?1 AND project_id=?3 AND registration_id=?4 ORDER BY sequence DESC LIMIT ?2",
+                (Some(_), None) => "SELECT sequence,body FROM tasks WHERE sequence<=?1 AND project_id=?3 ORDER BY sequence DESC LIMIT ?2",
+                (None, _) => "SELECT sequence,body FROM tasks WHERE sequence<=?1 ORDER BY sequence DESC LIMIT ?2",
+            };
+            let mut stmt = c.prepare(sql)?;
+            let mut rows = match (project_id, origin_id) {
+                (Some(project), Some(origin)) => stmt.query(params![through, limit + 1, project, origin])?,
+                (Some(project), None) => stmt.query(params![through, limit + 1, project])?,
+                (None, _) => stmt.query(params![through, limit + 1])?,
+            };
+            let mut items = Vec::new();
+            let mut bytes = 0;
+            let mut last = None;
+            while let Some(row) = rows.next()? {
+                if items.len() == limit as usize {
+                    return Ok(TaskPage { items, next_cursor: last });
+                }
+                let mut task: TaskView = decode(row.get(1)?)?;
+                task.result = None;
+                task.delivery_error = None;
+                bytes += serde_json::to_vec(&task)?.len();
+                // Keep room for the response envelope, commas, and cursor.
+                if bytes > MAX_FRAME_BYTES / 2 {
+                    if last.is_none() {
+                        return Err(SchedulerError::new("task_summary_too_large", "Task summary exceeds the page limit"));
+                    }
+                    return Ok(TaskPage { items, next_cursor: last });
+                }
+                last = Some(row.get(0)?);
+                items.push(task);
+            }
+            Ok(TaskPage { items, next_cursor: None })
+        }).await
+    }
+
+    pub async fn list_sessions(
+        &self,
+        auth: &AuthContext,
+        project_id: &str,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<SessionPage> {
+        auth.require_admin()?;
+        let project_id = project_id.to_owned();
+        let through = before.map_or(i64::MAX, |cursor| cursor.saturating_sub(1));
+        let limit = limit.clamp(1, 50);
+        self.run(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT r.id, r.adapter_id, r.session_id, COUNT(*), MAX(t.created_at_ms), MAX(t.sequence) AS newest,
+                   CASE WHEN json_extract(r.body, '$.route.parameters.transport') = 'native_inbox'
+                        THEN 'native_inbox' END
+                 FROM tasks t JOIN registrations r ON r.id=t.registration_id AND r.project_id=t.project_id
+                 WHERE t.project_id=?1 GROUP BY r.id
+                 HAVING newest<=?2 ORDER BY newest DESC LIMIT ?3",
+            )?;
+            let mut rows = stmt.query(params![project_id, through, limit + 1])?;
+            let mut items = Vec::new();
+            let mut last = None;
+            while let Some(row) = rows.next()? {
+                if items.len() == limit as usize {
+                    return Ok(SessionPage { items, next_cursor: last });
+                }
+                items.push(SessionSummary {
+                    origin_id: row.get(0)?,
+                    adapter_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    task_count: row.get::<_, i64>(3)? as u64,
+                    last_dispatched_at_ms: row.get(4)?,
+                    transport: row.get(6)?,
+                });
+                last = Some(row.get(5)?);
+            }
+            Ok(SessionPage { items, next_cursor: None })
+        })
+        .await
+    }
+
+    pub async fn task_detail(&self, auth: &AuthContext, id: &str) -> Result<TaskDetail> {
+        auth.require_admin()?;
+        let id = id.to_owned();
+        self.run(move |c| {
+            let spec = get_spec(c, &id)?;
+            let session_id = c
+                .query_row(
+                    "SELECT session_id FROM registrations WHERE id=?1",
+                    [&spec.view.parent_registration_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(TaskDetail {
+                origin_id: spec.view.parent_registration_id.clone(),
+                task: spec.view,
+                prompt: spec.prompt,
+                timeout_seconds: spec.timeout_seconds,
+                session_id,
+            })
+        })
+        .await
     }
 
     pub async fn claim_next(&self) -> Result<Option<QueuedTask>> {
@@ -434,7 +695,8 @@ impl Store {
             ));
         }
         if completion.execution_state == ExecutionState::Succeeded
-            && (completion.result.exit_code != Some(0) || completion.result.error_class.is_some())
+            && (completion.result.exit_code.is_some_and(|code| code != 0)
+                || completion.result.error_class.is_some())
         {
             return Err(SchedulerError::new(
                 "invalid_completion",
@@ -630,6 +892,26 @@ fn get_project(c: &Connection, id: &str) -> Result<ProjectRecord> {
             .ok_or_else(|| SchedulerError::new("project_not_found", "Project is not registered"))?,
     )
 }
+fn get_profile(c: &Connection, id: &str) -> Result<AgentProfile> {
+    let body = c
+        .query_row("SELECT body FROM profiles WHERE id=?1", [id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| SchedulerError::new("profile_not_found", "Agent profile was not found"))?;
+    decode(body)
+}
+fn resolve_legacy_origin(c: &Connection, project: &str, session: &str) -> Result<Option<String>> {
+    let mut stmt =
+        c.prepare("SELECT id FROM registrations WHERE project_id=?1 AND session_id=?2 LIMIT 2")?;
+    let mut rows = stmt.query(params![project, session])?;
+    let origin = rows.next()?.map(|row| row.get(0)).transpose()?;
+    if rows.next()?.is_some() {
+        return Err(SchedulerError::new(
+            "ambiguous_session_id",
+            "Multiple origins have this host session ID; use the Runspur origin ID",
+        ));
+    }
+    Ok(origin)
+}
 fn get_registration(c: &Connection, id: &str) -> Result<Registration> {
     decode(
         c.query_row("SELECT body FROM registrations WHERE id=?1", [id], |r| {
@@ -743,6 +1025,8 @@ mod tests {
             prompt: "fixed marker".into(),
             idempotency_key: key.into(),
             timeout_seconds: None,
+            execution_mode: ExecutionMode::ReadOnly,
+            write_scope: Vec::new(),
         }
     }
     fn completion(spec: &QueuedTask) -> Completion {
@@ -781,6 +1065,356 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_policy_validates_the_bound_origin_and_profiles_before_enqueue() {
+        let (_dir, store, _project, origin, _) = fixture().await;
+        store
+            .put_profile(AgentProfile {
+                profile_id: "codex-main".into(),
+                kind: AgentKind::CodexDesktop,
+                program: None,
+                model: None,
+                reasoning_effort: None,
+                environment_keys: Default::default(),
+            })
+            .await
+            .unwrap();
+        let rejected = store
+            .submit_with_worker_policy(
+                &origin,
+                request("policy"),
+                |main, worker, request, binding| {
+                    assert_eq!(main.profile_id, binding.main_agent_profile_id);
+                    assert_eq!(binding.route.adapter_id, "test");
+                    assert_eq!(worker.profile_id, request.worker_profile_id);
+                    Err(SchedulerError::new(
+                        "adapter_not_authorized",
+                        "Test rejects this adapter",
+                    ))
+                },
+            )
+            .await;
+        assert_eq!(rejected.unwrap_err().code, "adapter_not_authorized");
+        assert!(store.claim_next().await.unwrap().is_none());
+
+        let accepted = store
+            .submit_with_worker_policy(&origin, request("policy"), |_, _, _, _| Ok(()))
+            .await
+            .unwrap();
+        assert!(!accepted.deduplicated);
+        assert_eq!(
+            store.claim_next().await.unwrap().unwrap().view.task_id,
+            accepted.task_id
+        );
+    }
+
+    async fn same_host_id_from_second_adapter(
+        store: &Store,
+        project: &ProjectRecord,
+    ) -> AuthContext {
+        let registration = store
+            .ensure_registration(
+                &project.config.project_id,
+                "codex-main",
+                ParentRoute {
+                    adapter_id: "other-adapter".into(),
+                    session_id: "conversation-a".into(),
+                    parameters: serde_json::Value::Null,
+                },
+                "generation-one",
+                project.root.clone(),
+            )
+            .await
+            .unwrap();
+        AuthContext::Root {
+            project_id: registration.project_id,
+            registration_id: registration.registration_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_host_session_ids_are_listed_as_separate_origins() {
+        let (dir, store, project, first_origin, _) = fixture().await;
+        let second_origin = same_host_id_from_second_adapter(&store, &project).await;
+        let (_, second_id) = second_origin.root().unwrap();
+        let mut second_route = store.registration(second_id).await.unwrap().route;
+        second_route.parameters =
+            serde_json::json!({"transport":"native_inbox","private":"unpublished"});
+        store
+            .refresh_route(second_id, second_route, "new-generation".into())
+            .await
+            .unwrap();
+        let first = store.submit(&first_origin, request("same")).await.unwrap();
+        let second = store.submit(&second_origin, request("same")).await.unwrap();
+        drop(store);
+        let store = Store::open(&dir.path().join("state.sqlite3")).unwrap();
+
+        let admin = AuthContext::Admin;
+        let page = store
+            .list_sessions(&admin, &project.config.project_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].transport.as_deref(), Some("native_inbox"));
+        assert!(
+            !serde_json::to_value(&page.items[0])
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("private")
+        );
+        assert!(
+            serde_json::to_value(&page.items[1])
+                .unwrap()
+                .get("transport")
+                .is_none()
+        );
+        for (item, auth, accepted, adapter) in [
+            (&page.items[0], &second_origin, &second, "other-adapter"),
+            (&page.items[1], &first_origin, &first, "test"),
+        ] {
+            assert_eq!(item.session_id, "conversation-a");
+            assert_eq!(item.task_count, 1);
+            assert_eq!(item.adapter_id, adapter);
+            assert_eq!(item.origin_id, auth.root().unwrap().1);
+            let filtered = store
+                .origin_task_history(
+                    &admin,
+                    &project.config.project_id,
+                    &item.origin_id,
+                    None,
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(filtered.items.len(), 1);
+            assert_eq!(filtered.items[0].task_id, accepted.task_id);
+            let detail = store.task_detail(&admin, &accepted.task_id).await.unwrap();
+            assert_eq!(detail.origin_id, item.origin_id);
+        }
+        assert_eq!(
+            store
+                .origin_task_history(
+                    &first_origin,
+                    &project.config.project_id,
+                    &page.items[0].origin_id,
+                    None,
+                    10,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "permission_denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_legacy_session_id_cannot_return_combined_history() {
+        let (_dir, store, project, first_origin, _) = fixture().await;
+        let second_origin = same_host_id_from_second_adapter(&store, &project).await;
+        store.submit(&first_origin, request("same")).await.unwrap();
+        store.submit(&second_origin, request("same")).await.unwrap();
+
+        let result = store
+            .task_history(
+                &AuthContext::Admin,
+                Some(&project.config.project_id),
+                Some("conversation-a"),
+                None,
+                10,
+            )
+            .await;
+        assert_eq!(result.unwrap_err().code, "ambiguous_session_id");
+    }
+
+    #[tokio::test]
+    async fn operator_task_history_pages_across_projects_and_keeps_origin_scope() {
+        let (dir, store, project, first_origin, second_origin) = fixture().await;
+        let mut other_project = project.clone();
+        other_project.config.project_id = new_id();
+        other_project.root = dir.path().join("other");
+        store.put_project(other_project.clone()).await.unwrap();
+        let other_registration = store
+            .ensure_registration(
+                &other_project.config.project_id,
+                "codex-main",
+                ParentRoute {
+                    adapter_id: "test".into(),
+                    session_id: "conversation-a".into(),
+                    parameters: serde_json::json!({}),
+                },
+                "generation-one",
+                other_project.root,
+            )
+            .await
+            .unwrap();
+        let other_origin = AuthContext::Root {
+            project_id: other_registration.project_id,
+            registration_id: other_registration.registration_id,
+        };
+        let first = store.submit(&first_origin, request("first")).await.unwrap();
+        let other = store.submit(&other_origin, request("other")).await.unwrap();
+        let second = store
+            .submit(&second_origin, request("second"))
+            .await
+            .unwrap();
+        let third = store.submit(&first_origin, request("third")).await.unwrap();
+        let project_id = Some(project.config.project_id.as_str());
+        let admin = AuthContext::Admin;
+
+        let sessions = store
+            .list_sessions(&admin, &project.config.project_id, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(sessions.items[0].session_id, "conversation-a");
+        assert_eq!(sessions.items[0].task_count, 2);
+        let older_sessions = store
+            .list_sessions(&admin, &project.config.project_id, sessions.next_cursor, 1)
+            .await
+            .unwrap();
+        assert_eq!(older_sessions.items[0].session_id, "conversation-b");
+        assert_eq!(older_sessions.items[0].task_count, 1);
+        assert_eq!(older_sessions.next_cursor, None);
+        assert_eq!(
+            store
+                .list_sessions(&first_origin, &project.config.project_id, None, 1)
+                .await
+                .unwrap_err()
+                .code,
+            "permission_denied"
+        );
+
+        let page = store
+            .task_history(&admin, project_id, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].task_id, third.task_id);
+        assert_eq!(page.items[1].task_id, second.task_id);
+        let newer = store.submit(&first_origin, request("newer")).await.unwrap();
+        let older = store
+            .task_history(&admin, project_id, None, page.next_cursor, 2)
+            .await
+            .unwrap();
+        assert_eq!(older.items.len(), 1);
+        assert_eq!(older.items[0].task_id, first.task_id);
+        assert_eq!(older.next_cursor, None);
+        let all = store
+            .task_history(&admin, None, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.items.len(), 5);
+        assert_eq!(all.items[3].task_id, other.task_id);
+        let session = store
+            .task_history(&admin, project_id, Some("conversation-a"), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(session.items[0].task_id, newer.task_id);
+        assert_eq!(session.items[1].task_id, third.task_id);
+        let older_dispatches = store
+            .task_history(
+                &admin,
+                project_id,
+                Some("conversation-a"),
+                session.next_cursor,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(older_dispatches.items.len(), 1);
+        assert_eq!(older_dispatches.items[0].task_id, first.task_id);
+        assert_eq!(older_dispatches.next_cursor, None);
+        assert_eq!(
+            store
+                .task_history(&admin, None, Some("conversation-a"), None, 10)
+                .await
+                .unwrap_err()
+                .code,
+            "project_required"
+        );
+        assert_eq!(
+            store
+                .task_history(&first_origin, None, None, None, 10)
+                .await
+                .unwrap_err()
+                .code,
+            "permission_denied"
+        );
+        assert_eq!(store.list_tasks(&first_origin, 50).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn operator_task_detail_preserves_original_input_and_current_state() {
+        let (_dir, store, _project, origin, _) = fixture().await;
+        let mut submission = request("detail");
+        submission.prompt = "逐行检查\nwith original whitespace  ".into();
+        submission.timeout_seconds = Some(55);
+        let accepted = store.submit(&origin, submission.clone()).await.unwrap();
+        let spec = store.claim_next().await.unwrap().unwrap();
+        let completion = completion(&spec);
+        store
+            .commit_completion(completion, "path".into(), "digest".into(), "hash".into())
+            .await
+            .unwrap();
+        let detail = store
+            .task_detail(&AuthContext::Admin, &accepted.task_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.task.task_id, accepted.task_id);
+        assert_eq!(detail.task.execution_state, ExecutionState::Succeeded);
+        assert_eq!(detail.task.result.unwrap().summary, "marker");
+        assert_eq!(detail.prompt, submission.prompt);
+        assert_eq!(detail.timeout_seconds, 55);
+        assert_eq!(detail.session_id.as_deref(), Some("conversation-a"));
+        assert_eq!(
+            store
+                .task_detail(&origin, &accepted.task_id)
+                .await
+                .unwrap_err()
+                .code,
+            "permission_denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_main_waits_for_original_session_and_keeps_history() {
+        let (_dir, store, original, origin, _) = fixture().await;
+        let submitted = store.submit(&origin, request("existing")).await.unwrap();
+        let mut updated = original.clone();
+        updated.config.main_agent_profile_id = "claude-main".into();
+
+        let error = store.put_project(updated.clone()).await.unwrap_err();
+        assert_eq!(error.code, "project_switch_busy");
+
+        let spec = store.claim_next().await.unwrap().unwrap();
+        let result = store
+            .commit_completion(
+                completion(&spec),
+                "result.json".into(),
+                "hash".into(),
+                nonce_hash("nonce"),
+            )
+            .await
+            .unwrap();
+        let error = store.put_project(updated.clone()).await.unwrap_err();
+        assert_eq!(error.code, "project_switch_busy");
+
+        store
+            .acknowledge(&origin, &result.delivery_id, "nonce")
+            .await
+            .unwrap();
+        store.put_project(updated).await.unwrap();
+        let historical = store
+            .task(&AuthContext::Admin, &submitted.task_id)
+            .await
+            .unwrap();
+        assert_eq!(historical.project_id, original.config.project_id);
+        assert_eq!(
+            historical.delivery_state,
+            DeliveryState::AcknowledgedByParent
+        );
+        assert!(store.submit(&origin, request("new")).await.is_err());
+    }
+
+    #[tokio::test]
     async fn queue_claim_is_atomic_under_concurrency() {
         let (_dir, store, _project, a, _b) = fixture().await;
         store.submit(&a, request("one")).await.unwrap();
@@ -808,6 +1442,26 @@ mod tests {
             .unwrap();
         assert_eq!(result.execution_state, ExecutionState::Succeeded);
         assert_eq!(result.delivery_state, DeliveryState::Pending);
+        assert!(
+            store
+                .task_for_delivery(&AuthContext::Admin, &result.delivery_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .task_for_delivery(&b, &result.delivery_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .task_for_delivery(&a, &result.delivery_id)
+                .await
+                .unwrap()
+                .task_id,
+            task.task_id
+        );
         assert_eq!(store.due_deliveries(10).await.unwrap().len(), 1);
         store
             .commit_completion(
@@ -916,15 +1570,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_worker_can_succeed_without_a_process_exit_code() {
+        let (_dir, store, _project, origin, _) = fixture().await;
+        store.submit(&origin, request("managed")).await.unwrap();
+        let spec = store.claim_next().await.unwrap().unwrap();
+        let mut result = completion(&spec);
+        result.result.exit_code = None;
+        let stored = store
+            .commit_completion(result, "p".into(), "h".into(), nonce_hash("n"))
+            .await
+            .unwrap();
+        assert_eq!(stored.execution_state, ExecutionState::Succeeded);
+        assert_eq!(stored.delivery_state, DeliveryState::Pending);
+    }
+
+    #[tokio::test]
     async fn invalid_attempt_rolls_back_and_fast_parent_ack_wins_over_transport_update() {
         let (_dir, store, _project, a, _b) = fixture().await;
         store.submit(&a, request("one")).await.unwrap();
         let spec = store.claim_next().await.unwrap().unwrap();
-        for (exit_code, error_class) in [
-            (None, None),
-            (Some(1), None),
-            (Some(0), Some("reported_failure")),
-        ] {
+        for (exit_code, error_class) in [(Some(1), None), (Some(0), Some("reported_failure"))] {
             let mut invalid = completion(&spec);
             invalid.result.exit_code = exit_code;
             invalid.result.error_class = error_class.map(str::to_owned);

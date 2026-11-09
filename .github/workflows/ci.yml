@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows:
-    name: Windows checks
+  cli:
+    name: Windows CLI
     runs-on: windows-latest
     timeout-minutes: 25
     env:
@@ -28,6 +28,10 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
       - name: Install Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -42,26 +46,51 @@ jobs:
         run: cargo test --workspace --locked
       - name: Build programs
         run: cargo build --workspace --locked
-      - name: Check desktop smoke syntax
+      - name: Check Codex desktop host test syntax
         run: node --check scripts/windows-desktop-smoke.cjs
       - name: Validate PowerShell scripts
         run: powershell.exe -NoProfile -File scripts/check-powershell.ps1
-      - name: Package programs for installer regression tests
+      - name: Pack and test the Windows x64 npm CLI
         run: |
-          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed." }
-          $tag = "v$($metadata.packages[0].version)"
-          ./scripts/package-windows.ps1 -Tag $tag -BinaryDir target/debug -OutputDir "$env:RUNNER_TEMP/runspur-package"
-      - name: Test PowerShell 5.1 installation and installed programs
-        run: |
-          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed." }
-          $tag = "v$($metadata.packages[0].version)"
-          powershell.exe -NoProfile -File scripts/test-distribution.ps1 -Tag $tag -PackageDir "$env:RUNNER_TEMP/runspur-package"
-      - name: Verify latest-release bootstrap with PowerShell 7
-        if: github.repository == 'ohmacemace/runspur'
-        run: |
-          $install = Join-Path $env:RUNNER_TEMP "runspur-public-bootstrap"
-          ./install.ps1 -InstallDir $install -NoPathUpdate
-          & (Join-Path $install "schedulerctl.exe") --version
-          if ($LASTEXITCODE -ne 0) { throw "Public installer smoke failed." }
+          $output = Join-Path $env:RUNNER_TEMP "runspur-npm-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          ./scripts/package-npm.ps1 -BinaryDir target/debug -OutputDir $output
+          $archives = @(Get-ChildItem -LiteralPath $output -Filter 'runspur-*.tgz' -File)
+          if ($archives.Count -ne 1) { throw "Expected exactly one npm tarball in $output." }
+          powershell.exe -NoProfile -File scripts/test-npm-distribution.ps1 -PackagePath $archives[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "npm distribution smoke failed." }
+
+  desktop:
+    name: Windows desktop app
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: apps/runspur-desktop
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/runspur-desktop/package-lock.json
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
+      - name: Cache desktop Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: apps/runspur-desktop/src-tauri
+      - name: Install Windows app dependencies
+        run: npm.cmd ci
+      - name: Build Windows app UI
+        run: npm.cmd run ui:build
+      - name: Check Windows app Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Test Windows app Rust workspace
+        env:
+          TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked

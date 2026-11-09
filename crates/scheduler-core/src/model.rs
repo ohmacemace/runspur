@@ -44,6 +44,10 @@ pub struct DispatchLimits {
     pub max_dispatches_per_root: u32,
     pub default_timeout_seconds: u32,
     pub max_timeout_seconds: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_workspace_write: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_project_write: bool,
 }
 impl Default for DispatchLimits {
     fn default() -> Self {
@@ -52,6 +56,18 @@ impl Default for DispatchLimits {
             max_dispatches_per_root: 20,
             default_timeout_seconds: 3600,
             max_timeout_seconds: 86400,
+            allow_workspace_write: false,
+            allow_project_write: false,
+        }
+    }
+}
+
+impl DispatchLimits {
+    pub fn permits_execution(&self, mode: ExecutionMode) -> bool {
+        match mode {
+            ExecutionMode::ReadOnly => true,
+            ExecutionMode::WorkspaceWrite => self.allow_workspace_write || self.allow_project_write,
+            ExecutionMode::ProjectWrite => self.allow_project_write,
         }
     }
 }
@@ -70,7 +86,7 @@ pub struct ProjectConfig {
     pub limits: DispatchLimits,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     CodexDesktop,
@@ -108,6 +124,8 @@ pub enum OriginSource {
     HostEnvironment,
     RequestMetadata,
     SessionHook,
+    /// The adapter supplied a native Claude tool-use ID. The hook registration resolves it.
+    ClaudeTool,
 }
 
 /// Supplied by the integration adapter, never by SubmitTask's model arguments.
@@ -169,6 +187,21 @@ pub enum DeliveryState {
     Uncertain,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    #[default]
+    ReadOnly,
+    WorkspaceWrite,
+    ProjectWrite,
+}
+
+impl ExecutionMode {
+    pub fn is_read_only(&self) -> bool {
+        *self == Self::ReadOnly
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitTask {
@@ -176,6 +209,10 @@ pub struct SubmitTask {
     pub prompt: String,
     pub idempotency_key: String,
     pub timeout_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "ExecutionMode::is_read_only")]
+    pub execution_mode: ExecutionMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_scope: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +260,39 @@ pub struct TaskView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskPage {
+    pub items: Vec<TaskView>,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub origin_id: String,
+    pub adapter_id: String,
+    pub session_id: String,
+    pub task_count: u64,
+    pub last_dispatched_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPage {
+    pub items: Vec<SessionSummary>,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDetail {
+    pub task: TaskView,
+    pub prompt: String,
+    pub timeout_seconds: u32,
+    #[serde(default)]
+    pub origin_id: String,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedTask {
     pub view: TaskView,
     pub prompt: String,
@@ -231,6 +301,10 @@ pub struct QueuedTask {
     pub project_config: ProjectConfig,
     pub profile: AgentProfile,
     pub attempt_id: String,
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

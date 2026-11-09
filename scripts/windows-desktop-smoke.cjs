@@ -1,5 +1,5 @@
-// Opt-in live smoke: creates a fresh project and desktop thread, then runs a real Probe.
-// The diagnostic MCP client supplies that new thread's metadata; no model ack is simulated.
+// Opt-in live smoke: verifies that a diagnostic MCP client cannot impersonate a real Desktop thread.
+// A live Desktop owner exists for the thread, but the MCP bridge was started by this script.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -174,8 +174,7 @@ async function main() {
   const binary = name => path.join(args['--bin-dir'], `${name}.exe`);
   for (const name of ['schedulerd', 'schedulerctl', 'scheduler-mcp']) assert.ok(fs.statSync(binary(name)).isFile());
   const report = { started_at: new Date().toISOString(), artifact_root: root, checks: {},
-    metadata_source: 'diagnostic client, using only the newly created desktop thread',
-    parent_ack: 'not_obtained', model_consumption: 'not_verified' };
+    metadata_source: 'diagnostic client' };
   const record = (name, details = true) => { report.checks[name] = details; log(name, typeof details === 'object' ? details : {}); };
   const control = async (...parameters) => {
     const result = await execute(binary('schedulerctl'), ['--data-dir', data, ...parameters], {
@@ -210,7 +209,6 @@ async function main() {
   let creator;
   let mcp;
   let observer;
-  let reader;
   try {
     service = daemon();
     record('daemon_health', (await healthy()).service);
@@ -250,93 +248,25 @@ async function main() {
     assert.equal(tools.tools.length, 7);
     const missing = await mcp.request('tools/call', { name: 'scheduler_context', arguments: {} });
     assert.equal(missing.structuredContent.code, 'origin_session_unavailable');
-    const tool = async (name, parameters = {}) => {
-      const result = await mcp.request('tools/call', { name, arguments: parameters, _meta: { threadId } });
-      if (result.isError) throw new Error(`${name}: ${JSON.stringify(result.structuredContent)}`);
-      return result.structuredContent;
-    };
-    const context = await tool('scheduler_context');
-    assert.equal(context.project.config.project_id, report.project_id);
-    assert.equal(context.origin.route.session_id, threadId);
-    record('mcp_automatic_origin', { missing_metadata_rejected: true });
-
-    const marker = `RUNSPUR_SMOKE_${randomUUID()}`;
-    const gate = path.join(project, 'release-probe');
-    const parameters = { worker_profile_id: 'probe', prompt: JSON.stringify({ summary: marker, wait_for_file: gate, delay_ms: 1, attempt_control: data }),
-      idempotency_key: 'live-smoke', timeout_seconds: 30 };
-    const accepted = await tool('scheduler_submit', parameters);
-    report.task_id = accepted.task_id;
-    const duplicate = await tool('scheduler_submit', parameters);
-    assert.equal(duplicate.task_id, accepted.task_id);
-    assert.equal(duplicate.deduplicated, true);
-    const before = await tool('scheduler_task', { task_id: accepted.task_id });
-    assert.equal(before.result, null);
-    assert.equal(accepted.result_pending, true);
-    record('nonblocking_durable_submission', { task_id: accepted.task_id, deduplicated: true });
-    fs.writeFileSync(gate, 'release', { flag: 'wx' });
-    let task;
-    const deliveryDeadline = Date.now() + 60000;
-    do {
-      task = await control('status', accepted.task_id);
-      if (task.delivery_state === 'accepted_by_transport') break;
-      if (['uncertain', 'refused'].includes(task.delivery_state)) throw new Error(`Delivery stopped: ${task.delivery_state}: ${task.delivery_error}`);
-      await delay(250);
-    } while (Date.now() < deliveryDeadline);
-    assert.equal(task.execution_state, 'succeeded');
-    assert.equal(task.result.summary, marker);
-    assert.ok(task.result.verification.some(v => v.description === 'worker_control_plane_access' && v.outcome === 'denied'));
-    assert.equal(task.delivery_state, 'accepted_by_transport', task.delivery_error);
-    assert.ok(task.parent_turn_id);
-    report.delivery_id = task.delivery_id;
-    report.parent_turn_id = task.parent_turn_id;
-    record('real_worker_and_active_desktop_push', { execution_state: task.execution_state, delivery_state: task.delivery_state,
-      parent_turn_id: task.parent_turn_id, worker_dispatch_denied: true });
-
-    reader = await core();
-    let turn;
-    let item;
-    const historyDeadline = Date.now() + 15000;
-    do {
-      const history = await reader.request('thread/turns/list', { threadId, limit: 5, sortDirection: 'desc', itemsView: 'full' });
-      turn = history.data.find(value => value.id === task.parent_turn_id);
-      item = turn?.items.find(value => value.type === 'functionCallOutput' && value.name === 'runspur_worker_result');
-      // A turn header can be visible before its persisted items. Wait for the correlated output as well.
-      if (item && ['completed', 'failed', 'interrupted'].includes(turn.status)) break;
-      await delay(250);
-    } while (Date.now() < historyDeadline);
-    assert.ok(turn, 'The accepted turn must exist in the original thread');
-    assert.ok(item, 'Persisted result must keep its tool-output identity');
-    const output = JSON.parse(item.output);
-    assert.equal(output.task_id, task.task_id);
-    assert.equal(output.delivery_id, task.delivery_id);
-    assert.equal(output.result.summary, marker);
-    assert.equal(output.project_id, report.project_id);
-    assert.ok(output.ack_nonce);
-    report.model_error = turn.error?.codexErrorInfo ?? null;
-    record('original_thread_tool_output', { item_type: item.type, name: item.name, turn_status: turn.status, model_error: report.model_error });
-    await reader.close();
-    reader = null;
-    await mcp.close();
-    mcp = null;
-
-    // Only the daemon launched by this script is stopped. Accepted results must survive restart without re-sending.
-    service.kill();
-    await stop(service);
-    service = daemon();
-    await healthy();
-    const recovered = await control('status', task.task_id);
-    assert.equal(recovered.delivery_state, 'accepted_by_transport');
-    assert.equal(recovered.parent_turn_id, task.parent_turn_id);
-    assert.equal(recovered.delivery_id, task.delivery_id);
-    record('accepted_delivery_survives_daemon_restart');
-    report.result = 'passed_transport_and_worker';
+    const diagnostic = await mcp.request('tools/call', {
+      name: 'scheduler_submit',
+      arguments: { worker_profile_id: 'probe', prompt: 'Must not be dispatched', idempotency_key: 'diagnostic-origin' },
+      _meta: { threadId },
+    });
+    assert.equal(diagnostic.isError, true);
+    assert.equal(diagnostic.structuredContent.code, 'origin_session_unavailable');
+    assert.match(diagnostic.structuredContent.message, /verify the local host/);
+    const history = await control('tasks', '--project', report.project_id);
+    assert.equal(history.items.length, 0);
+    record('diagnostic_cannot_impersonate_the_live_desktop_owner', { missing_metadata_rejected: true });
+    report.result = 'passed_diagnostic_identity_rejected';
   } catch (error) {
     report.result = 'failed';
     report.error = error.message;
     process.exitCode = 1;
   } finally {
     observer?.close();
-    for (const rpc of [reader, mcp, creator]) if (rpc) await rpc.close();
+    for (const rpc of [mcp, creator]) if (rpc) await rpc.close();
     if (service) { service.kill(); await stop(service); }
     report.finished_at = new Date().toISOString();
     fs.writeFileSync(path.join(root, 'report.json'), JSON.stringify(report, null, 2), { flag: 'wx' });

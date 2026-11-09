@@ -1,0 +1,20 @@
+{
+  "name": "runspur-desktop",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/stage-sidecars.mjs && tauri dev",
+    "ui:dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "ui:build": "tsc --noEmit && vite build",
+    "package:windows": "tauri build --bundles nsis"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.6"
+  }
+}

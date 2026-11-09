@@ -1,144 +1,73 @@
 # Runspur
 
+**English** · [简体中文](docs/README.zh-CN.md)
+
 [![CI](https://github.com/ohmacemace/runspur/actions/workflows/ci.yml/badge.svg)](https://github.com/ohmacemace/runspur/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A project-scoped, asynchronous Agent scheduler written in Rust.
+Runspur coordinates work between Codex and Claude Code. The main Agent can delegate a task and keep working while a child Agent runs in the background. Runspur delivers the result to the conversation that started the task.
 
-Runspur accepts tasks through project-level Skills and MCP tools, runs workers in the background, persists their results, and actively delivers each result back to the conversation that submitted it. The parent Agent can keep working while independent tasks run.
+- Choose a main Agent, available workers, and their file permissions per project.
+- Inspect each dispatch, its result, and its delivery status by project or conversation.
+- Use the CLI or the Windows app to connect projects and manage their configuration.
 
-**The first release is a Windows x64 backend preview with a CLI and MCP bridge.** Codex desktop delivery is experimental and currently restricted to a verified desktop distribution.
-
-## Install
-
-Run in PowerShell on Windows x64:
-
-```powershell
-irm https://raw.githubusercontent.com/ohmacemace/runspur/main/install.ps1 | iex
-```
-
-The installer downloads the latest GitHub Release, verifies its SHA-256 checksum and program versions, installs into `%LOCALAPPDATA%\Runspur\bin`, and adds that directory to your user PATH. No Rust, Node.js, or administrator access is required.
-
-Open a new terminal and check:
-
-```powershell
-schedulerd --version
-schedulerctl --help
-scheduler-mcp --help
-```
-
-Run the installer again to update. Close running Runspur programs before updating. Tasks, credentials, and project settings are stored separately from the installation directory.
-
-You can also download the ZIP and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/ohmacemace/runspur/releases).
-
-### Install a specific version or location
-
-Download the script, inspect it, and invoke it with parameters:
-
-```powershell
-Invoke-WebRequest https://raw.githubusercontent.com/ohmacemace/runspur/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.1.1
-.\install.ps1 -Version v0.1.1 -InstallDir "C:\tools\runspur" -NoPathUpdate
-```
-
-Offline installation uses the release ZIP and checksum file:
-
-```powershell
-.\install.ps1 -Version v0.1.1 -ArchivePath ".\runspur-v0.1.1-windows-x86_64.zip" -ChecksumPath ".\SHA256SUMS.txt"
-```
-
-Requires Windows PowerShell 5.1 or later. To uninstall, stop Runspur, remove its installation directory, and remove that directory from your user PATH. Keep or delete the application data separately as needed.
+Runspur supports **Windows x64**. Claude Code **2.1.319 or later** is required for either Agent role. Automatic delivery has been verified with a specific Codex desktop distribution and native Claude Code CLI sessions. Claude Desktop is untested. [Compatibility details](#compatibility)
 
 ## Quick start
 
-### 1. Start the daemon
+### CLI via npm
 
-Keep this terminal running. Press Ctrl+C to stop it gracefully.
-
-```powershell
-schedulerd
-```
-
-The daemon runs as the current user. It stores its database, protected credentials, and artifacts in the user's application data directory.
-
-### 2. Initialize a project
-
-In another terminal, replace the project path with an existing directory:
+The CLI is distributed through npm as `runspur`. Version 0.1.2 supports Windows x64. With Node.js and npm installed, run the following in PowerShell. [Runspur on npm](https://www.npmjs.com/package/runspur)
 
 ```powershell
-$project = "D:\path\your-project"
-$mcp = (Get-Command scheduler-mcp.exe).Source
-schedulerctl init --project-root $project
-schedulerctl integrate --project-root $project --mcp-program $mcp
-schedulerctl doctor --project-root $project
+npm install --global runspur
+runspur new
 ```
 
-This creates:
+The setup wizard asks for the project folder, name, main Agent, child Agents, and file permissions. It starts the shared scheduler in the background when needed. Review the project integration and confirm to save. Install the Agent CLIs you plan to use before running the wizard.
 
-```text
-<project>/
-  .agent-scheduler/project.json
-  .agents/skills/agent-scheduler/SKILL.md
-  .codex/config.toml                     # mcp_servers.runspur_scheduler
-```
-
-The default parent profile is `codex-desktop`; the default worker pool contains only `probe`, a deterministic diagnostic worker. The installer preserves unrelated MCP settings and refuses to overwrite conflicting integration files.
-
-`saved_requires_host_reload` means the files were saved. Load or reload the project integration using your host's supported mechanism, and confirm that the Skill and MCP tools are available.
-
-For a custom state directory, pass the same absolute `--data-dir` to the daemon and management commands. Running `schedulerctl integrate` with that option also records the directory in the MCP entry. `RUNSPUR_DATA_DIR` is supported as well.
-
-### 3. Submit a task
-
-Use the project's `agent-scheduler` Skill in a normal Codex desktop conversation. Start with `scheduler_context` and `scheduler_agents`, then call `scheduler_submit` with an allowed worker.
-
-Example diagnostic task:
-
-```json
-{
-  "worker_profile_id": "probe",
-  "prompt": "RUNSPUR_PROBE_OK",
-  "idempotency_key": "first-probe",
-  "timeout_seconds": 30
-}
-```
-
-Submission returns a `task_id`, `execution_state: queued`, and `result_pending: true` after persistence. It does not wait for the worker. Repeating the same key and input in the same conversation returns the original task; different input returns `idempotency_conflict`.
-
-Continue independent work after submission. Results are pushed by the outbox; continuous polling is unnecessary. After the parent has actually consumed a result, it confirms consumption with `scheduler_ack`.
-
-Conversation identity is resolved on every call from host metadata such as `_meta.threadId`. Project settings never contain a fixed conversation ID: tasks from A return to A, and tasks from B return to B. Missing reliable identity returns `origin_session_unavailable`.
-
-## Agent profiles
+Run `runspur new` again to connect another project. Use `runspur edit` to change an existing project's configuration. Run `runspur --help` for commands. If PowerShell blocks the npm-generated script shims, use `npm.cmd` and `runspur.cmd`.
 
 ```powershell
-schedulerctl profiles
+runspur projects
+runspur edit
 ```
 
-This discovers missing defaults and lists trusted local profiles, preserving existing profiles with the same ID. On Windows, discovery checks desktop Codex core installations and `%USERPROFILE%\.local\bin\claude.exe`.
+Use `runspur stop` before updating with `npm update --global runspur` or uninstalling with `npm uninstall --global runspur`. Project settings and task history are stored separately from the npm installation.
 
-Edit `allowed_worker_profile_ids` in `.agent-scheduler/project.json` to include existing profiles such as `codex-cli` or `claude-cli`, retain the project UUID, then import it again:
+#### Delegate a task
 
-```powershell
-schedulerctl init --project-root $project
-```
+For a Codex main agent, open the project in the verified Codex desktop host. For a Claude Code main agent on 2.1.319 or later, save the project integration and run `claude` in the project folder. Approve the project's Runspur MCP server if Claude Code asks. Runspur uses a project-local hook and the originating session's local inbox. Your Claude Code inbound messaging settings still apply.
 
-A new project can use `init --workers probe,claude-cli,codex-cli` if those profiles are available.
+The main Agent uses the Runspur Skill and MCP tools to select an available worker and delegate tasks. For example, Codex can send a test failure investigation to Claude Code while it continues an independent change. The findings return to the original Codex conversation. To resume a native Claude Code conversation, run `claude --resume <session-id>` in the project folder.
 
-Import a custom profile with `schedulerctl profile-put --file <profile.json>`:
+Both clients preview the previous adapter's Runspur entries before switching main Agents. Saving preserves project identity and history. Finish pending tasks and acknowledgments before switching.
 
-```json
-{
-  "profile_id": "my-claude",
-  "kind": "claude_print",
-  "program": "C:\\path\\claude.exe",
-  "model": null,
-  "reasoning_effort": null,
-  "environment_keys": ["ANTHROPIC_API_KEY"]
-}
-```
+### Windows app
 
-Windows workers require the actual `.exe`, rather than a `.cmd` or `.ps1` wrapper. Adapters construct their own read-only arguments. Profiles contain allowed environment-variable names, not their values. Model submissions cannot specify executable paths, raw flags, roles, projects, or parent routes.
+The Windows desktop app uses a separate NSIS installer. Build it from source and open Runspur. It starts the scheduler automatically. Go to **Projects → Add project**, choose a folder, select the main Agent, workers, and permissions, then review and confirm the changes. Open a new conversation in the selected Agent from that folder. [Windows installer build instructions](#build-the-windows-desktop-app)
+
+Use **Settings → Language** to follow the system language or select English or Simplified Chinese.
+
+## Project configuration
+
+The project stores its Agent choices and permission policy in `.agent-scheduler/project.json`. Runspur previews project integration changes and preserves unrelated host settings. Select child Agents from a different provider than the main Agent. Child Agents run through their provider's CLI.
+
+Use `runspur edit` to select and change a project interactively. For automation, `runspur configure --project-root <folder>` previews changes to the specified project and preserves any fields you omit. Add `--apply` to save. `runspur configure --help` lists the available flags.
+
+### Choose worker permissions
+
+New projects start with read-only workers. The two write modes use a verified Claude Code 2.1.319 worker and a separate task workspace.
+
+| Mode | CLI project setting | What the worker can do |
+| --- | --- | --- |
+| `read_only` | `--permission read-only` (default) | Inspect the project |
+| `workspace_write` | `--permission workspace-write` | Create or edit files explicitly named in the task's `write_scope` |
+| `project_write` | `--permission project-write` | Create or edit UTF-8 text files across the project using the file tools. The task omits `write_scope` |
+
+Project-wide authorization also allows tasks with a narrower `write_scope`. The main Agent chooses the execution mode for each task from the modes exposed by `scheduler_agents`.
+
+Both write modes save changes to the isolated workspace and record them in `changes.json`. The file tools enforce the project boundary, and the main Agent reviews and applies authorized changes to the original project.
 
 ## Tools and commands
 
@@ -149,20 +78,26 @@ Windows workers require the actual `.exe`, rather than a `.cmd` or `.ps1` wrappe
 | `scheduler_submit` | Persist and enqueue a task |
 | `scheduler_task` / `scheduler_tasks` | Inspect this conversation's tasks |
 | `scheduler_cancel` | Request cancellation |
+| `scheduler_claim` | Retrieve the result named in a Claude Code native inbox notification, using `delivery_id` in the originating conversation |
 | `scheduler_ack` | Confirm consumption using `delivery_id` and `ack_nonce` |
 
 Local operator commands:
 
 ```powershell
-schedulerctl projects
-schedulerctl status
-schedulerctl status <task-id>
-schedulerctl cancel <task-id>
+runspur projects
+runspur sessions --project <project-id>
+runspur tasks --project <project-id> --origin <origin-id>
+runspur task <task-id>
+runspur status
+runspur status <task-id>
+runspur cancel <task-id>
 ```
+
+`sessions` lists conversations with dispatches in the project. Pass its `origin_id` to `tasks --origin` to filter dispatches by their original conversation. `--session` accepts legacy host session IDs when they identify a single origin in the project. Pass `next_cursor` to `--before` to read the next page with the same filters. `task` returns the prompt, original conversation, result or failure, and delivery details. The CLI and Windows app use the same operator queries.
 
 Operator access permits inspection and cancellation across conversations, but cannot impersonate a parent's consumption acknowledgment. `scheduler-mcp` uses stdio; its stdout is reserved for MCP messages.
 
-Default limits: two global workers, two workers per project, 20 new tasks per internal root registration, a 3,600-second default timeout, and an 86,400-second maximum timeout. Configure project limits in the manifest and the global limit with `schedulerd --max-workers`. Renewing a registration does not reset its dispatch count.
+The defaults allow two concurrent workers globally and per project, with a one-hour task timeout. The project manifest controls project limits. To set a different global concurrency limit for a foreground scheduler, use `runspur start --max-workers`.
 
 ## Reliability model
 
@@ -170,7 +105,7 @@ Execution and delivery have separate states:
 
 - `succeeded`, `failed`, `canceled`, and `timed_out` describe execution.
 - `pending`, `retry_wait`, `held`, and `orphaned` retain results while delivery waits or retries.
-- `accepted_by_transport` means the original channel accepted the result and returned a correlated turn ID.
+- `accepted_by_transport` means the original channel accepted the result. The record can include a host receipt such as a turn ID.
 - `acknowledged_by_parent` means the original parent confirmed consumption with the correct nonce.
 - `uncertain` stops automatic retransmission when the result may already have arrived.
 
@@ -186,16 +121,14 @@ Artifacts are stored as `artifacts/<task-id>/<attempt-id>/{stdout.jsonl,stderr.l
 | --- | --- |
 | Windows x64 daemon, CLI, and MCP stdio | Implemented and tested |
 | Project integration, automatic registration, isolation, and idempotency | Covered by real-process integration tests |
-| Probe worker | Executed in the live desktop smoke; diagnostic only |
-| Codex exec / Claude print workers | Adapters and parsers implemented; successful real-model tasks still need validation |
+| Codex exec / Claude print workers | Both support read-only tasks. Both write modes use Claude Code 2.1.319 |
 | Codex Windows desktop delivery | Experimental; verified distribution only |
-| Real parent-model consumption and acknowledgment | Not yet validated; previous model probes hit `usageLimitExceeded` |
-| Claude parent inbox, other parent entrypoints, and dsh | Not enabled |
+| Claude Code CLI as main agent | Project-local native inbox integration on 2.1.319 or later |
+| Claude Desktop | Untested |
+| Parent-model consumption and acknowledgment | Verified with Codex desktop and native Claude Code |
 | macOS / Linux platform backends | Not implemented or validated |
 
 The verified desktop baseline is `OpenAI.Codex 26.1103.4239.0`, with core `0.167.0-alpha.3.2`. The adapter checks the user's desktop process, project directory, exact owner, and a pinned `app.asar` hash. Unknown distributions are rejected. This is an internal desktop IPC integration, not a stable public desktop API.
-
-Workers are read-only in this release. GUI, code-writing/worktree/merge workflows, startup registration, and interactive worker approval bridging are not implemented.
 
 ## Build and test
 
@@ -208,25 +141,44 @@ cargo test --workspace --locked
 cargo build --workspace --locked
 ```
 
-There are 32 Rust tests covering transactions, automatic conversation isolation, permissions, credentials, named pipes, Job Objects, subprocess output, cancellation, timeouts, MCP stdio, uncertain delivery, and crash recovery. CI also runs eight PowerShell installation tests, including update rollback, archive validation, and a real installed-service round trip.
+Rust tests cover transactions, conversation isolation, permissions, credentials, subprocess supervision, MCP stdio, dispatch history, delivery, and crash recovery. Windows CI also validates the npm tarball through an offline installation and runs the desktop UI build and desktop Rust tests.
 
-The opt-in desktop smoke requires Node.js and the verified running Windows desktop. It creates a fresh project and thread, executes Probe through the real daemon, checks persisted tool-output identity, and restarts its own daemon to verify the delivery receipt:
+The opt-in desktop origin check requires Node.js and the verified running Codex desktop. It creates a temporary project and conversation, then checks that an independent MCP client cannot impersonate that conversation using its thread ID.
 
 ```powershell
 node .\scripts\windows-desktop-smoke.cjs --codex-core "C:\path\to\desktop-core\codex.exe" --artifact-parent "C:\existing\temporary-directory"
 ```
 
-The diagnostic client supplies the new thread's metadata. It does not simulate a real parent-model acknowledgment. Reports and temporary projects stay local.
+Use the executable bundled with Codex desktop for `--codex-core` and an existing directory for `--artifact-parent`. The test writes a local report. To check live delegation and acknowledgment, run a task from the verified Codex conversation itself.
 
-To build a release package and test installation:
+### Package the CLI for npm
+
+Build on Windows x64, then use the version shown in the generated filename to test the tarball.
 
 ```powershell
-cargo build --workspace --release --locked
-.\scripts\package-windows.ps1 -Tag v0.1.1
-.\scripts\test-distribution.ps1 -Tag v0.1.1
+cargo build --locked --release -p scheduler-app --bins
+.\scripts\package-npm.ps1
+.\scripts\test-npm-distribution.ps1 -PackagePath .\dist\runspur-<version>.tgz
 ```
 
-Main pushes and pull requests run Windows CI. Version tags trigger the same checks, followed by release builds, installation tests, checksums, and GitHub Release publication.
+The package version comes from Cargo. A maintainer publishes the verified tarball with `npm.cmd publish` and completes npm account verification. The same tarball supports offline installation with `npm.cmd install --global`.
+
+### Build the Windows desktop app
+
+Runspur Desktop ships with its scheduler. The installed app uses the same default scheduler data directory as the CLI, `%LOCALAPPDATA%\Runspur\Runspur\data`, and connects to the running scheduler when available. Build the x64 Windows installer with Rust, MSVC Build Tools, Node.js, npm, and WebView2.
+
+```powershell
+cargo build --locked --release -p scheduler-app --bins
+Set-Location apps/runspur-desktop
+npm ci
+npm run package:windows
+```
+
+The installer is generated under `src-tauri/target/release/bundle/nsis/`. Use `npm run dev` to run a development window with its own scheduler state in `%LOCALAPPDATA%\Runspur\state\desktop-dev`.
+
+## Contributing
+
+Bug reports, code fixes, and documentation improvements are welcome. The guide covers issue reports, pull requests, and local verification. [Contributing guide](docs/CONTRIBUTING.md)
 
 ## License
 

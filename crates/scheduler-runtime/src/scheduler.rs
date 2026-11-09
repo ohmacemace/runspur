@@ -7,13 +7,20 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use scheduler_core::*;
-use scheduler_platform::{CredentialStore, DataPaths, SecretKey, WorkerRegistry, is_running};
+use scheduler_platform::{
+    CredentialStore, DataPaths, SecretKey, WorkerRegistry, identity, is_running,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CodexDesktopAdapter, DeliveryOutcome, ParentAdapter, failed, run_worker};
+use crate::claude_inbox::{ClaudeInboxRegistry, is_native_route};
+use crate::claude_session::ClaudeSessionAdapter;
+use crate::{
+    CodexDesktopAdapter, DeliveryOutcome, ParentAdapter, ProcessWorkerAdapter, WorkerAdapter,
+    WorkerContext, failed,
+};
 
 pub struct Scheduler {
     pub store: Store,
@@ -23,6 +30,9 @@ pub struct Scheduler {
     credentials: CredentialStore,
     master_key: SecretKey,
     parents: HashMap<String, Arc<dyn ParentAdapter>>,
+    parent_kinds: Arc<HashMap<AgentKind, Arc<dyn ParentAdapter>>>,
+    claude_inbox: Option<Arc<ClaudeInboxRegistry>>,
+    worker_adapters: Arc<HashMap<AgentKind, Arc<dyn WorkerAdapter>>>,
     active: Mutex<HashMap<String, CancellationToken>>,
     wake_tasks: Notify,
     wake_delivery: Notify,
@@ -31,10 +41,14 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(paths: DataPaths, max_workers: usize) -> Result<Arc<Self>> {
-        Self::with_parents(
+        let inbox = Arc::new(ClaudeInboxRegistry::default());
+        let claude = ClaudeSessionAdapter(paths.clone(), inbox.clone());
+        Self::build(
             paths,
             max_workers,
-            vec![Arc::new(CodexDesktopAdapter::default())],
+            vec![Arc::new(CodexDesktopAdapter::default()), Arc::new(claude)],
+            process_workers(),
+            Some(inbox),
         )
     }
     pub fn with_parents(
@@ -42,8 +56,47 @@ impl Scheduler {
         max_workers: usize,
         parents: Vec<Arc<dyn ParentAdapter>>,
     ) -> Result<Arc<Self>> {
+        Self::with_adapters(paths, max_workers, parents, process_workers())
+    }
+
+    pub fn with_adapters(
+        paths: DataPaths,
+        max_workers: usize,
+        parents: Vec<Arc<dyn ParentAdapter>>,
+        workers: Vec<Arc<dyn WorkerAdapter>>,
+    ) -> Result<Arc<Self>> {
+        Self::build(paths, max_workers, parents, workers, None)
+    }
+
+    fn build(
+        paths: DataPaths,
+        max_workers: usize,
+        parents: Vec<Arc<dyn ParentAdapter>>,
+        workers: Vec<Arc<dyn WorkerAdapter>>,
+        claude_inbox: Option<Arc<ClaudeInboxRegistry>>,
+    ) -> Result<Arc<Self>> {
         if !(1..=64).contains(&max_workers) {
             bail!("Global worker limit must be between 1 and 64");
+        }
+        let mut parent_ids = HashMap::new();
+        let mut parent_kinds = HashMap::new();
+        for parent in parents {
+            if parent_ids
+                .insert(parent.id().into(), parent.clone())
+                .is_some()
+                || parent_kinds.insert(parent.profile_kind(), parent).is_some()
+            {
+                bail!("Duplicate parent adapter or profile kind");
+            }
+        }
+        let mut worker_adapters = HashMap::new();
+        for worker in workers {
+            if worker_adapters
+                .insert(worker.profile_kind(), worker)
+                .is_some()
+            {
+                bail!("Duplicate worker adapter profile kind");
+            }
         }
         let credentials = CredentialStore::new(paths.clone());
         let master_key = credentials.ensure(&CredentialRef::Admin)?;
@@ -55,10 +108,10 @@ impl Scheduler {
             master_key,
             workers: WorkerRegistry::default(),
             stop: CancellationToken::new(),
-            parents: parents
-                .into_iter()
-                .map(|p| (p.id().to_owned(), p))
-                .collect(),
+            parents: parent_ids,
+            parent_kinds: Arc::new(parent_kinds),
+            claude_inbox,
+            worker_adapters: Arc::new(worker_adapters),
             active: Mutex::new(HashMap::new()),
             wake_tasks: Notify::new(),
             wake_delivery: Notify::new(),
@@ -75,6 +128,16 @@ impl Scheduler {
         project_id: &str,
         origin: Option<&OriginSession>,
     ) -> Result<AuthContext> {
+        self.resolve_origin_with_peer(project_id, origin, None)
+            .await
+    }
+
+    pub(crate) async fn resolve_origin_with_peer(
+        &self,
+        project_id: &str,
+        origin: Option<&OriginSession>,
+        peer: Option<&ProcessIdentity>,
+    ) -> Result<AuthContext> {
         let project = self.store.project(project_id).await?;
         let profile = self
             .store
@@ -83,7 +146,87 @@ impl Scheduler {
         authorize_origin(&project.config, &profile.profile_id, origin, false)?;
         let origin = origin.context("Origin was not available")?;
         let adapter = self.adapter_for_profile(&profile)?;
-        let resolved = adapter.resolve(&project, origin).await?;
+        let resolved = match peer {
+            Some(peer) => adapter.resolve_from_peer(&project, origin, peer).await?,
+            None => adapter.resolve(&project, origin).await?,
+        };
+        if resolved.route.adapter_id != adapter.id() {
+            bail!("Parent adapter returned an invalid route");
+        }
+        self.register_origin(project_id, &profile, resolved).await
+    }
+
+    pub(crate) async fn register_claude_hook(
+        &self,
+        project_id: &str,
+        origin: &OriginSession,
+        hook: ClaudeHookCall,
+        peer: &ProcessIdentity,
+    ) -> Result<Value> {
+        let inbox = self
+            .claude_inbox
+            .as_ref()
+            .context("Native Claude Code inbox support is unavailable")?;
+        let project = self.store.project(project_id).await?;
+        let profile = self
+            .store
+            .profile(&project.config.main_agent_profile_id)
+            .await?;
+        authorize_origin(&project.config, &profile.profile_id, Some(origin), false)?;
+        if profile.kind != AgentKind::ClaudePrint {
+            bail!("Claude Code is not this project's main Agent");
+        }
+        let program = profile
+            .program
+            .as_deref()
+            .context("This Claude Code profile has no executable")?;
+        let session = uuid::Uuid::parse_str(&origin.provider_session_id)
+            .context("Invalid Claude Code session ID")?;
+        if self
+            .adapter_for_profile(&profile)?
+            .resolve(&project, origin)
+            .await
+            .is_ok()
+        {
+            bail!("This Claude Code session already has a managed owner");
+        }
+        inbox
+            .register(&project, session, hook, peer, program, &self.paths.root)
+            .await?;
+        Ok(json!({"registered":true}))
+    }
+
+    pub(crate) async fn resolve_claude_call(
+        &self,
+        project_id: &str,
+        origin: &OriginSession,
+        peer: &ProcessIdentity,
+    ) -> Result<(AuthContext, String)> {
+        let inbox = self
+            .claude_inbox
+            .as_ref()
+            .context("Native Claude Code inbox support is unavailable")?;
+        let project = self.store.project(project_id).await?;
+        let profile = self
+            .store
+            .profile(&project.config.main_agent_profile_id)
+            .await?;
+        authorize_origin(&project.config, &profile.profile_id, Some(origin), false)?;
+        if profile.kind != AgentKind::ClaudePrint {
+            bail!("Claude Code is not this project's main Agent");
+        }
+        let (resolved, operation_sha256) =
+            inbox.consume(&project, &origin.provider_session_id, peer)?;
+        let auth = self.register_origin(project_id, &profile, resolved).await?;
+        Ok((auth, operation_sha256))
+    }
+
+    async fn register_origin(
+        &self,
+        project_id: &str,
+        profile: &AgentProfile,
+        resolved: crate::ResolvedParent,
+    ) -> Result<AuthContext> {
         let registration = self
             .store
             .ensure_registration(
@@ -101,20 +244,7 @@ impl Scheduler {
     }
 
     fn adapter_for_profile(&self, profile: &AgentProfile) -> Result<Arc<dyn ParentAdapter>> {
-        let id = match profile.kind {
-            AgentKind::CodexDesktop => "codex-desktop",
-            _ => {
-                return Err(SchedulerError::new(
-                    "main_entrypoint_unsupported",
-                    "This profile has no verified automatic parent-return adapter",
-                )
-                .into());
-            }
-        };
-        self.parents
-            .get(id)
-            .cloned()
-            .context("Parent adapter is unavailable on this build")
+        Ok(parent_adapter(&self.parent_kinds, profile)?.clone())
     }
 
     pub async fn handle(&self, auth: &AuthContext, operation: Operation) -> Result<Value> {
@@ -122,6 +252,10 @@ impl Scheduler {
             Operation::Health => {
                 json!({"version":env!("CARGO_PKG_VERSION"),"protocol_version":WIRE_VERSION,
                 "platform":std::env::consts::OS,"active_workers":self.active.lock().map_err(|_| anyhow::anyhow!("Active registry poisoned"))?.len()})
+            }
+            Operation::Shutdown => {
+                auth.require_admin()?;
+                serde_json::to_value(identity(std::process::id())?)?
             }
             Operation::PutProfile(profile) => {
                 auth.require_admin()?;
@@ -140,8 +274,23 @@ impl Scheduler {
                                     .config
                                     .allowed_worker_profile_ids
                                     .contains(&p.profile_id))
-                            .map(|p| json!({"profile_id":p.profile_id,
-                            "kind":p.kind,"worker":p.kind != AgentKind::CodexDesktop}))
+                            .map(|p| {
+                                let adapter = self.worker_adapters.get(&p.kind);
+                                let modes = [
+                                    ExecutionMode::ReadOnly,
+                                    ExecutionMode::WorkspaceWrite,
+                                    ExecutionMode::ProjectWrite,
+                                ]
+                                .into_iter()
+                                .filter(|mode| {
+                                    project.config.limits.permits_execution(*mode)
+                                        && adapter.is_some_and(|worker| worker.supports(*mode))
+                                })
+                                .collect::<Vec<_>>();
+                                json!({"profile_id":p.profile_id,"kind":p.kind,
+                                    "worker": adapter.is_some(),
+                                    "execution_modes": modes})
+                            })
                             .collect::<Vec<_>>()
                     )
                 } else {
@@ -161,20 +310,16 @@ impl Scheduler {
                     .store
                     .profile(&project.config.main_agent_profile_id)
                     .await?;
-                self.adapter_for_profile(&profile)?;
+                let parent = self.adapter_for_profile(&profile)?;
                 for worker in &project.config.allowed_worker_profile_ids {
-                    if self.store.profile(worker).await?.kind == AgentKind::CodexDesktop {
-                        return Err(SchedulerError::new(
-                            "worker_not_supported",
-                            "Desktop parent cannot be in the worker pool",
-                        )
-                        .into());
-                    }
+                    let worker_profile = self.store.profile(worker).await?;
+                    let worker = worker_adapter(&self.worker_adapters, &worker_profile)?;
+                    validate_pair(parent.as_ref(), worker.as_ref())?;
                 }
-                let saved = self.store.put_project(project).await?;
                 self.credentials.ensure(&CredentialRef::Project {
-                    project_id: saved.config.project_id.clone(),
+                    project_id: project.config.project_id.clone(),
                 })?;
+                let saved = self.store.put_project(project).await?;
                 json!(saved)
             }
             Operation::ListProjects => {
@@ -183,14 +328,67 @@ impl Scheduler {
             }
             Operation::SessionStatus => {
                 let (project, registration) = auth.root()?;
-                json!({"project":self.store.project(project).await?, "origin":self.store.registration(registration).await?})
+                let origin = self.store.registration(registration).await?;
+                json!({"project":self.store.project(project).await?, "origin":{
+                    "origin_id": origin.registration_id,
+                    "workspace_root": origin.workspace_root,
+                    "route": {"adapter_id": origin.route.adapter_id, "session_id": origin.route.session_id}
+                }})
             }
             Operation::Submit(submission) => {
-                let task = self.store.submit(auth, submission).await?;
+                let parents = self.parent_kinds.clone();
+                let workers = self.worker_adapters.clone();
+                let task = self
+                    .store
+                    .submit_with_worker_policy(
+                        auth,
+                        submission,
+                        move |main, worker, task, origin| {
+                            let parent = parent_adapter(&parents, main)?;
+                            if origin.route.adapter_id != parent.id() {
+                                return Err(SchedulerError::new(
+                                    "main_profile_mismatch",
+                                    "Origin adapter no longer matches the main profile",
+                                ));
+                            }
+                            let worker = worker_adapter(&workers, worker)?;
+                            validate_pair(parent.as_ref(), worker.as_ref())?;
+                            if !worker.supports(task.execution_mode) {
+                                return Err(SchedulerError::new(
+                                    "execution_mode_unsupported",
+                                    "Selected child Agent does not support this execution mode",
+                                ));
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await?;
                 self.wake_tasks.notify_one();
                 json!(task)
             }
             Operation::GetTask { task_id } => json!(self.store.task(auth, &task_id).await?),
+            Operation::ClaimClaudeDelivery { delivery_id } => {
+                let (_, origin_id) = auth.root()?;
+                let registration = self.store.registration(origin_id).await?;
+                if !is_native_route(&registration.route) {
+                    bail!("Result claims are available to the native Claude Code origin only");
+                }
+                let task = self.store.task_for_delivery(auth, &delivery_id).await?;
+                json!(DeliveryEnvelope {
+                    schema_version: SCHEMA_VERSION,
+                    kind: "task_completed".into(),
+                    task_id: task.task_id,
+                    delivery_id: task.delivery_id,
+                    project_id: task.project_id,
+                    workspace_root: task.workspace_root,
+                    execution_state: task.execution_state,
+                    result: task.result.context("Terminal task has no result")?,
+                    ack_nonce: self.master_key.ack_nonce(&delivery_id),
+                })
+            }
+            Operation::RegisterClaudeHook(_) => {
+                bail!("This request requires a verified Claude Code hook connection")
+            }
             Operation::ListTasks { limit } => {
                 let mut tasks = self.store.list_tasks(auth, limit.min(50)).await?;
                 for task in &mut tasks {
@@ -200,6 +398,60 @@ impl Scheduler {
                     }
                 }
                 json!(tasks)
+            }
+            Operation::ListSessions {
+                project_id,
+                before,
+                limit,
+            } => {
+                json!(
+                    self.store
+                        .list_sessions(auth, &project_id, before, limit)
+                        .await?
+                )
+            }
+            Operation::TaskHistory {
+                project_id,
+                session_id,
+                before,
+                limit,
+            } => {
+                json!(
+                    self.store
+                        .task_history(
+                            auth,
+                            project_id.as_deref(),
+                            session_id.as_deref(),
+                            before,
+                            limit
+                        )
+                        .await?
+                )
+            }
+            Operation::OriginTaskHistory {
+                project_id,
+                origin_id,
+                before,
+                limit,
+            } => {
+                json!(
+                    self.store
+                        .origin_task_history(auth, &project_id, &origin_id, before, limit)
+                        .await?
+                )
+            }
+            Operation::TaskDetail {
+                task_id,
+                offset,
+                revision,
+            } => {
+                let detail = self.store.task_detail(auth, &task_id).await?;
+                let detail = serde_json::to_string(&detail)?;
+                json!(TaskDetailChunk::from_json(
+                    &detail,
+                    offset,
+                    revision.as_deref()
+                )?)
             }
             Operation::CancelTask { task_id } => {
                 let task = self.store.request_cancel(auth, &task_id).await?;
@@ -320,7 +572,7 @@ impl Scheduler {
                         break;
                     }
                 };
-                let token = CancellationToken::new();
+                let token = self.stop.child_token();
                 if let Ok(mut active) = self.active.lock() {
                     active.insert(task.view.task_id.clone(), token.clone());
                 }
@@ -342,15 +594,32 @@ impl Scheduler {
         {
             token.cancel();
         }
-        let mut completion =
-            match run_worker(&task, &self.paths, &self.workers, token, &self.store).await {
+        let mut completion = match worker_adapter(&self.worker_adapters, &task.profile) {
+            Ok(adapter) if adapter.supports(task.execution_mode) => match adapter
+                .run(
+                    &task,
+                    WorkerContext {
+                        paths: &self.paths,
+                        processes: &self.workers,
+                        store: &self.store,
+                    },
+                    token,
+                )
+                .await
+            {
                 Ok(completion) => completion,
                 Err(error) => failed(
                     &task,
                     "worker_start_failed",
                     crate::redact_text(&error.to_string()),
                 ),
-            };
+            },
+            _ => failed(
+                &task,
+                "execution_mode_unsupported",
+                "No installed worker supports this task".into(),
+            ),
+        };
         completion.result.summary = preview(&completion.result.summary, MAX_RESULT_BYTES);
         completion.result.verification.truncate(64);
         for verification in &mut completion.result.verification {
@@ -416,11 +685,7 @@ impl Scheduler {
             config: spec.project_config,
             revision: String::new(),
         };
-        let origin = OriginSession {
-            provider_session_id: delivery.registration.route.session_id.clone(),
-            source: OriginSource::RequestMetadata,
-        };
-        match adapter.resolve(&project, &origin).await {
+        match adapter.refresh(&project, &delivery.registration).await {
             Ok(resolved) => {
                 delivery.registration = self
                     .store
@@ -471,6 +736,9 @@ impl Scheduler {
                 Some(parent_turn_id),
                 0,
             ),
+            DeliveryOutcome::AcceptedWithoutReference => {
+                (DeliveryState::AcceptedByTransport, None, None, 0)
+            }
             DeliveryOutcome::Busy => (
                 DeliveryState::RetryWait,
                 Some("Parent is working; result remains queued".into()),
@@ -518,12 +786,52 @@ impl Scheduler {
 
     pub fn request_shutdown(&self) {
         self.stop.cancel();
-        if let Ok(active) = self.active.lock() {
-            for token in active.values() {
-                token.cancel();
-            }
-        }
     }
+}
+
+fn parent_adapter<'a>(
+    adapters: &'a HashMap<AgentKind, Arc<dyn ParentAdapter>>,
+    profile: &AgentProfile,
+) -> scheduler_core::Result<&'a Arc<dyn ParentAdapter>> {
+    adapters.get(&profile.kind).ok_or_else(|| {
+        SchedulerError::new(
+            "main_entrypoint_unsupported",
+            "This profile has no verified parent adapter",
+        )
+    })
+}
+
+fn process_workers() -> Vec<Arc<dyn WorkerAdapter>> {
+    vec![
+        Arc::new(ProcessWorkerAdapter(AgentKind::CodexExec, "codex")),
+        Arc::new(ProcessWorkerAdapter(AgentKind::ClaudePrint, "claude")),
+        Arc::new(ProcessWorkerAdapter(AgentKind::Probe, "diagnostic")),
+    ]
+}
+
+fn worker_adapter<'a>(
+    adapters: &'a HashMap<AgentKind, Arc<dyn WorkerAdapter>>,
+    profile: &AgentProfile,
+) -> scheduler_core::Result<&'a Arc<dyn WorkerAdapter>> {
+    adapters.get(&profile.kind).ok_or_else(|| {
+        SchedulerError::new(
+            "worker_not_supported",
+            "This profile has no installed worker adapter",
+        )
+    })
+}
+
+fn validate_pair(
+    parent: &dyn ParentAdapter,
+    worker: &dyn WorkerAdapter,
+) -> scheduler_core::Result<()> {
+    if parent.family() == worker.family() {
+        return Err(SchedulerError::new(
+            "same_agent_family",
+            "Select a child Agent from a different family than the main Agent",
+        ));
+    }
+    Ok(())
 }
 
 pub async fn durable_file(path: &Path, bytes: &[u8]) -> Result<()> {
