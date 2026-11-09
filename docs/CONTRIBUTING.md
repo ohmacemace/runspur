@@ -2,7 +2,7 @@
 
 **English** · [简体中文](#参与贡献)
 
-[Code of conduct](CODE_OF_CONDUCT.md) · [Report a security vulnerability](SECURITY.md)
+[Code of conduct](CODE_OF_CONDUCT.md)
 
 ## Report an issue
 
@@ -39,7 +39,7 @@ The development app uses separate local scheduler data. Verify CLI and Windows a
 
 [English](#contributing-to-runspur) · **简体中文**
 
-[行为准则](CODE_OF_CONDUCT.md#行为准则) · [报告安全漏洞](SECURITY.md#安全政策)
+[行为准则](CODE_OF_CONDUCT.md#行为准则)
 
 ### 报告问题
 
