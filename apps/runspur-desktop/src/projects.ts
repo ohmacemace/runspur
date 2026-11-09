@@ -65,6 +65,14 @@ const cleanupLabels: Partial<Record<string, Message>> = {
   claude_origin_hook: 'projectClaudeHook',
 };
 
+function setupFailure(message: Message, error: unknown): Notice {
+  const detail = error instanceof Error ? error.message : String(error);
+  const stateConflict = '[runspur_state_conflict]';
+  return detail.includes(stateConflict)
+    ? { message: 'projectDifferentState', detail: detail.replace(stateConflict, '').trim() }
+    : { message, detail };
+}
+
 export function createProjects(
   text: Translate,
   onProjects: (items: ProjectRecord[]) => void,
@@ -86,6 +94,11 @@ export function createProjects(
   const edit = element<HTMLButtonElement>('edit-project');
   const apply = element<HTMLButtonElement>('apply-project');
   const refreshAgents = element<HTMLButtonElement>('refresh-agents');
+  const setupFeedback = element('project-setup-feedback');
+  const setupMessage = element('project-setup-message');
+  const setupDetails = element<HTMLDetailsElement>('project-setup-details');
+  const setupError = element('project-setup-error');
+  const homeFeedback = element('project-feedback');
   let projects: ProjectRecord[] = [];
   let profiles: AgentProfile[] = [];
   let draft: Draft | undefined;
@@ -201,8 +214,22 @@ export function createProjects(
     preview = undefined;
     feedback = undefined;
     renderPreview();
-    showNotice(element('project-feedback'), text);
+    renderFeedback();
     renderControls();
+  }
+
+  function renderFeedback() {
+    const active: Notice | undefined = draft ? (!ready ? { message: 'schedulerNeeded' } : feedback) : undefined;
+    const detail = active?.detail ?? '';
+    if (setupError.textContent !== detail) setupDetails.open = false;
+    setupFeedback.hidden = !active;
+    setupFeedback.dataset.error = String(Boolean(detail));
+    setupMessage.textContent = active ? text(active.message) : '';
+    setupDetails.hidden = !detail;
+    setupError.textContent = detail;
+    homeFeedback.dataset.complete = String(!draft && (feedback?.message === 'projectSaved'
+      || feedback?.message === 'projectUpdated' || feedback?.message === 'projectSavedNativeClaude'));
+    showNotice(homeFeedback, text, draft ? undefined : feedback);
   }
 
   function render() {
@@ -260,10 +287,7 @@ export function createProjects(
       if (available.length === 0) workerList.append(label('p', text('noWorkers'), 'empty-state'));
     }
     showNotice(element('projects-notice'), text, !ready ? { message: 'schedulerNeeded' } : notice);
-    const feedbackNode = element('project-feedback');
-    feedbackNode.dataset.complete = String(feedback?.message === 'projectSaved' || feedback?.message === 'projectUpdated'
-      || feedback?.message === 'projectSavedNativeClaude');
-    showNotice(feedbackNode, text, !ready && draft ? { message: 'schedulerNeeded' } : feedback);
+    renderFeedback();
     renderPreview();
     renderControls();
   }
@@ -385,11 +409,12 @@ export function createProjects(
       if (ready) preview = planned;
       feedback = undefined;
     } catch (error) {
-      feedback = { message: 'projectPreviewError', detail: String(error) };
+      feedback = setupFailure('projectPreviewError', error);
     } finally {
       busy = false;
       render();
       if (preview) element('preview-title').focus();
+      else if (feedback?.detail) setupFeedback.focus();
     }
   });
 
@@ -411,11 +436,12 @@ export function createProjects(
       draft = undefined;
       feedback = { message: nativeClaude ? 'projectSavedNativeClaude' : updating ? 'projectUpdated' : 'projectSaved' };
     } catch (error) {
-      feedback = { message: 'projectSaveError', detail: String(error) };
+      feedback = setupFailure('projectSaveError', error);
     } finally {
       busy = false;
       render();
       if (!draft) choose.focus();
+      else if (feedback?.detail) setupFeedback.focus();
     }
   });
 

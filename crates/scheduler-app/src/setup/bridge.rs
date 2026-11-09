@@ -1,5 +1,6 @@
 use std::{fs, io::Read, path::Path};
 
+use anyhow::{Result, anyhow};
 use scheduler_core::MAX_FRAME_BYTES;
 use scheduler_platform::DataPaths;
 use serde_json::Value;
@@ -16,7 +17,8 @@ impl<'a> Bridge<'a> {
         args: &[&'a str],
         desired: Bridge<'_>,
         host_args: &[&'static str],
-    ) -> Option<Self> {
+        config_file: &Path,
+    ) -> Option<Result<Self>> {
         let options = args
             .strip_prefix(&["--project-root", "."])?
             .strip_suffix(host_args)?;
@@ -25,10 +27,30 @@ impl<'a> Bridge<'a> {
             ["--data-dir", path] if !path.is_empty() => Some(Path::new(*path)),
             _ => return None,
         };
-        (same_state(data_dir, desired.data_dir)
-            && (program == desired.program || packaged_bridge(program)))
-        .then_some(Self { program, data_dir })
+        if program != desired.program && !packaged_bridge(program) {
+            return None;
+        }
+        if same_state(data_dir, desired.data_dir) {
+            return Some(Ok(Self { program, data_dir }));
+        }
+        if data_dir.is_some_and(|path| !path.is_absolute()) {
+            return None;
+        }
+        let configured = state_description(data_dir);
+        let active = state_description(desired.data_dir);
+        Some(Err(anyhow!(
+            "[runspur_state_conflict] {} is configured for the Runspur state directory \"{configured}\". This Runspur instance uses \"{active}\". Open Runspur with the configured --data-dir to edit this project, or choose a separate project folder.",
+            config_file.display()
+        )))
     }
+}
+
+fn state_description(path: Option<&Path>) -> String {
+    let default = DataPaths::default_root().ok();
+    path.or(default.as_deref()).map_or_else(
+        || "default Runspur state directory".into(),
+        |path| path.display().to_string(),
+    )
 }
 
 fn same_state(left: Option<&Path>, right: Option<&Path>) -> bool {

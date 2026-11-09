@@ -7,6 +7,7 @@
     <title>Runspur</title>
   </head>
   <body>
+    <div class="app-shell">
     <header class="app-header">
       <div class="wordmark">
         <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true">
@@ -87,6 +88,13 @@
             </div>
             <p id="project-registered-note" class="notice" data-i18n="projectAlreadyConnected" hidden>This folder is already connected. Saving will update the existing project.</p>
           </header>
+          <div id="project-setup-feedback" class="setup-feedback" tabindex="-1" hidden>
+            <p id="project-setup-message" aria-live="polite"></p>
+            <details id="project-setup-details" hidden>
+              <summary data-i18n="technicalDetails">Technical details</summary>
+              <code id="project-setup-error"></code>
+            </details>
+          </div>
           <form id="project-form" hidden>
             <div class="project-fields">
               <div class="field">
@@ -259,6 +267,7 @@
         <p id="settings-message" class="settings-message" aria-live="polite"></p>
       </section>
     </main>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

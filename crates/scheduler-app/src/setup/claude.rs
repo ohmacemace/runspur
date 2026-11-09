@@ -21,7 +21,11 @@ fn entry(program: &str, data_dir: Option<&Path>) -> Value {
     json!({ "type": "stdio", "command": program, "args": args })
 }
 
-fn installed_bridge<'a>(current: &'a Value, desired: Bridge<'_>) -> Option<Bridge<'a>> {
+fn installed_bridge<'a>(
+    current: &'a Value,
+    desired: Bridge<'_>,
+    config_path: &Path,
+) -> Option<Result<Bridge<'a>>> {
     let object = current.as_object()?;
     if object.len() != 3 || current["type"] != "stdio" {
         return None;
@@ -31,7 +35,13 @@ fn installed_bridge<'a>(current: &'a Value, desired: Bridge<'_>) -> Option<Bridg
         .iter()
         .map(Value::as_str)
         .collect::<Option<_>>()?;
-    Bridge::recognize(current["command"].as_str()?, &args, desired, HOST_ARGS)
+    Bridge::recognize(
+        current["command"].as_str()?,
+        &args,
+        desired,
+        HOST_ARGS,
+        config_path,
+    )
 }
 
 fn document(bytes: Option<&[u8]>) -> Result<Value> {
@@ -177,7 +187,7 @@ pub(super) async fn prepare(
     let desired = Bridge { program, data_dir };
     let current = servers.get("runspur_scheduler");
     let bridge = if let Some(current) = current {
-        installed_bridge(current, desired).context(
+        installed_bridge(current, desired, &config_path).transpose()?.context(
             "Existing runspur_scheduler MCP entry differs; refusing to overwrite user configuration",
         )?
     } else {
@@ -272,7 +282,8 @@ pub(super) async fn cleanup(
         .as_ref()
         .and_then(|servers| servers.get("runspur_scheduler"))
     {
-        installed_bridge(current, desired)
+        installed_bridge(current, desired, &config_path)
+            .transpose()?
             .context("Existing Claude Code Runspur MCP entry has user changes")?
     } else {
         desired
@@ -303,6 +314,38 @@ pub(super) async fn cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_identifies_a_verified_entry_for_another_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let installed = root.join("installed state");
+        let current = root.join("preview state");
+        let path = root.join(MCP_PATH);
+        let before = serde_json::to_vec(&json!({"mcpServers": {
+            "runspur_scheduler": entry("scheduler-mcp", Some(&installed)),
+        }}))
+        .unwrap();
+        tokio::fs::write(&path, &before).await.unwrap();
+        let hook = prepare_hook(root, "scheduler-mcp", Some(&installed), true)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::setup::apply_files(&[hook.file]).await.unwrap();
+        let hook_path = root.join(HOOK_PATH);
+        let hook_before = tokio::fs::read(&hook_path).await.unwrap();
+
+        let error = cleanup(root, "new-bridge", Some(&current))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.starts_with("[runspur_state_conflict]"), "{error}");
+        assert!(error.contains(&installed.display().to_string()));
+        assert!(error.contains(&path.display().to_string()));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), before);
+        assert_eq!(tokio::fs::read(hook_path).await.unwrap(), hook_before);
+    }
 
     #[tokio::test]
     async fn native_hook_preserves_existing_project_settings_and_cleans_up_its_own_rule() {

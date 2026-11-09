@@ -151,7 +151,7 @@ pub(super) async fn prepare(
         let current = current
             .as_table_like_mut()
             .context("Existing runspur_scheduler entry is not a table")?;
-        let installed = installed_bridge(current, desired).context(
+        let installed = installed_bridge(current, desired, &config_path).transpose()?.context(
             "Existing runspur_scheduler MCP entry differs; refusing to overwrite user configuration",
         )?;
         let entry = mcp_entry(installed, config.integrations.mcp);
@@ -190,7 +190,8 @@ fn mcp_entry(bridge: Bridge<'_>, enabled: bool) -> toml_edit::Table {
 fn installed_bridge<'a>(
     current: &'a dyn toml_edit::TableLike,
     desired: Bridge<'_>,
-) -> Option<Bridge<'a>> {
+    config_path: &Path,
+) -> Option<Result<Bridge<'a>>> {
     let program = current.get("command")?.as_str()?;
     let args: Vec<_> = current
         .get("args")
@@ -200,7 +201,17 @@ fn installed_bridge<'a>(
                 .map(toml_edit::Value::as_str)
                 .collect::<Option<Vec<_>>>()
         })?;
-    Bridge::recognize(program, &args, desired, &[])
+    let recognized = Bridge::recognize(program, &args, desired, &[], config_path)?;
+    (recognized.is_ok() || is_generated_mcp_entry(current)).then_some(recognized)
+}
+
+fn is_generated_mcp_entry(current: &dyn toml_edit::TableLike) -> bool {
+    current
+        .iter()
+        .all(|(key, _)| matches!(key, "command" | "args" | "enabled"))
+        && current
+            .get("enabled")
+            .is_none_or(|enabled| enabled.as_bool().is_some())
 }
 
 pub(super) async fn cleanup(
@@ -240,13 +251,10 @@ pub(super) async fn cleanup(
             let current = current
                 .as_table_like()
                 .context("Existing runspur_scheduler entry is not a table")?;
-            if installed_bridge(current, Bridge { program, data_dir }).is_none()
-                || current
-                    .iter()
-                    .any(|(key, _)| !matches!(key, "command" | "args" | "enabled"))
-                || current
-                    .get("enabled")
-                    .is_some_and(|enabled| enabled.as_bool().is_none())
+            if !is_generated_mcp_entry(current)
+                || installed_bridge(current, Bridge { program, data_dir }, &config_path)
+                    .transpose()?
+                    .is_none()
             {
                 bail!("Existing Codex Runspur MCP entry has user changes");
             }

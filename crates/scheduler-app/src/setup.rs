@@ -1153,11 +1153,14 @@ mod tests {
             .unwrap();
         let path = root.join(MCP_PATH);
         let saved = tokio::fs::read(&path).await.unwrap();
-        assert!(
-            ProjectAdapter::Codex
-                .cleanup(root, "scheduler-mcp", Some(root))
-                .await
-                .is_err()
+        let error = ProjectAdapter::Codex
+            .cleanup(root, "scheduler-mcp", Some(root))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Existing Codex Runspur MCP entry has user changes"
         );
         assert_eq!(tokio::fs::read(path).await.unwrap(), saved);
     }
@@ -1181,11 +1184,10 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
 
         let other_state = root.join("other state");
-        assert!(
-            install_project(root, &config, desktop, Some(&other_state), &[])
-                .await
-                .is_err()
-        );
+        let error = install_project(root, &config, desktop, Some(&other_state), &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("[runspur_state_conflict]"));
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
     }
 
